@@ -1,0 +1,232 @@
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
+index 70eb24c..ef0f791 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
+@@ -7,6 +7,7 @@ import (
+ 	"go.uber.org/zap"
+ 
+ 	settingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
++	"github.com/kandev/kandev/internal/common/instructionrefs"
+ 	"github.com/kandev/kandev/internal/common/logger"
+ )
+ 
+@@ -101,5 +102,23 @@ func (d *Deployer) Deploy(ctx context.Context, req Request) (DeployResult, error
+ 		return DeployResult{}, nil
+ 	}
+ 	result := d.deliver(ctx, manifest, req.ExecutorType, req.WorkspacePath)
++	result.EntryInstruction = effectiveEntryInstruction(manifest, result.InstructionsDir)
+ 	return result, nil
+ }
++
++func effectiveEntryInstruction(manifest *Manifest, instructionsDir string) *string {
++	if manifest == nil {
++		return nil
++	}
++	for _, instruction := range manifest.Instructions {
++		if !instruction.IsEntry {
++			continue
++		}
++		content := instruction.Content
++		if instructionsDir != "" {
++			content = instructionrefs.Rewrite(content, instructionsDir)
++		}
++		return &content
++	}
++	return nil
++}
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+index d4ad184..a219e6a 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+@@ -89,6 +89,9 @@ func TestDeploy_Local_WritesSkillsAndInstructions(t *testing.T) {
+ 	if res.InstructionsDir != wantDir {
+ 		t.Errorf("instructions dir = %q, want %q", res.InstructionsDir, wantDir)
+ 	}
++	if res.EntryInstruction == nil || *res.EntryInstruction != "# instructions" {
++		t.Errorf("entry instruction = %v", res.EntryInstruction)
++	}
+ 	if data, err := os.ReadFile(filepath.Join(wantDir, "AGENTS.md")); err != nil {
+ 		t.Fatalf("read AGENTS.md: %v", err)
+ 	} else if string(data) != "# instructions" {
+@@ -201,7 +204,7 @@ func TestDeploy_Sprites_RewritesSiblingRefsInManifest(t *testing.T) {
+ 	base := t.TempDir()
+ 	lister := &fakeInstructionLister{files: map[string][]*skill.InstructionFile{
+ 		"claude-acp/p1": {
+-			{Filename: "AGENTS.md", Content: "See ./HEARTBEAT.md."},
++			{Filename: "AGENTS.md", Content: "See ./HEARTBEAT.md.", IsEntry: true},
+ 			{Filename: "HEARTBEAT.md", Content: "checklist"},
+ 		},
+ 	}}
+@@ -235,6 +238,9 @@ func TestDeploy_Sprites_RewritesSiblingRefsInManifest(t *testing.T) {
+ 	if strings.Contains(agentsContent, "./HEARTBEAT.md") {
+ 		t.Errorf("manifest AGENTS.md should not contain relative sibling ref, got %q", agentsContent)
+ 	}
++	if res.EntryInstruction == nil || *res.EntryInstruction != agentsContent {
++		t.Errorf("entry instruction = %v, want %q", res.EntryInstruction, agentsContent)
++	}
+ }
+ 
+ // TestDeploy_Docker_WritesSkillsToWorktree verifies the Docker strategy
+@@ -336,7 +342,7 @@ func TestDeploy_KanbanProfile_NoSkillsNoOp(t *testing.T) {
+ 	if entries, err := os.ReadDir(filepath.Join(base, "runtime")); err == nil && len(entries) > 0 {
+ 		t.Errorf("host runtime tree should be untouched, got %v", entries)
+ 	}
+-	if len(res.Metadata) != 0 || res.InstructionsDir != "" {
++	if len(res.Metadata) != 0 || res.InstructionsDir != "" || res.EntryInstruction != nil {
+ 		t.Errorf("empty manifest result = %+v", res)
+ 	}
+ }
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/types.go b/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
+index 9f44cb5..810b603 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
+@@ -92,4 +92,6 @@ type DeployResult struct {
+ 	// instruction files were written. May be empty when no
+ 	// instructions were materialised.
+ 	InstructionsDir string
++	// EntryInstruction is the effective entry instruction; non-nil empty content is an intentional profile override.
++	EntryInstruction *string
+ }
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
+index 1622265..4da1772 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
+@@ -48,9 +48,27 @@ func (m *Manager) runSkillDeploy(ctx context.Context, original, prepared *Launch
+ 			zap.Error(err))
+ 		return
+ 	}
++	if original.ACPSessionID == "" && original.McpMode != "office" {
++		prependEntryInstruction(prepared, result.EntryInstruction)
++	}
+ 	mergeSkillMetadata(prepared, result)
+ }
+ 
++func prependEntryInstruction(prepared *LaunchRequest, entry *string) {
++	if entry == nil || *entry == "" {
++		return
++	}
++	if prepared.TaskDescription == "" {
++		prepared.TaskDescription = *entry
++	} else {
++		prepared.TaskDescription = *entry + "\n\n---\n\n" + prepared.TaskDescription
++	}
++	if prepared.Metadata == nil {
++		prepared.Metadata = make(map[string]interface{})
++	}
++	prepared.Metadata["task_description"] = prepared.TaskDescription
++}
++
+ // mergeSkillMetadata applies the deployer's output to the prepared
+ // launch request: every metadata patch is written through, and the
+ // instructions directory is stamped under MetadataKeyInstructionsDir
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
+index a3c0c78..af6e14c 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
+@@ -80,6 +80,69 @@ func TestRunSkillDeploy_EmptySkillsInvokesDeployer(t *testing.T) {
+ 	}
+ }
+ 
++func TestRunSkillDeploy_FreshSessionPrependsEntryInstruction(t *testing.T) {
++	mgr := newSkillDeployTestManager(t)
++	entry := "# Managed instructions"
++	rec := &recordingDeployer{result: SkillDeployResult{EntryInstruction: &entry}}
++	mgr.skillDeployer = rec
++	mgr.agentProfileReader = &fakeProfileReader{profile: &settingsmodels.AgentProfile{ID: "p1", AgentID: "a1"}}
++	prepared := &LaunchRequest{TaskDescription: "User task"}
++
++	mgr.runSkillDeploy(context.Background(), &LaunchRequest{AgentProfileID: "p1"}, prepared)
++
++	if got, want := prepared.TaskDescription, "# Managed instructions\n\n---\n\nUser task"; got != want {
++		t.Fatalf("TaskDescription = %q, want %q", got, want)
++	}
++	if got, want := prepared.Metadata["task_description"], prepared.TaskDescription; got != want {
++		t.Fatalf("metadata task_description = %q, want %q", got, want)
++	}
++}
++
++func TestRunSkillDeploy_ResumeDoesNotRepeatEntryInstruction(t *testing.T) {
++	mgr := newSkillDeployTestManager(t)
++	entry := "# Managed instructions"
++	rec := &recordingDeployer{result: SkillDeployResult{EntryInstruction: &entry}}
++	mgr.skillDeployer = rec
++	mgr.agentProfileReader = &fakeProfileReader{profile: &settingsmodels.AgentProfile{ID: "p1", AgentID: "a1"}}
++	prepared := &LaunchRequest{TaskDescription: "Resume task"}
++
++	mgr.runSkillDeploy(context.Background(), &LaunchRequest{AgentProfileID: "p1", ACPSessionID: "acp-1"}, prepared)
++
++	if got := prepared.TaskDescription; got != "Resume task" {
++		t.Fatalf("resume TaskDescription = %q", got)
++	}
++}
++
++func TestRunSkillDeploy_EmptyEntryOverrideLeavesPromptUnchanged(t *testing.T) {
++	mgr := newSkillDeployTestManager(t)
++	entry := ""
++	rec := &recordingDeployer{result: SkillDeployResult{EntryInstruction: &entry}}
++	mgr.skillDeployer = rec
++	mgr.agentProfileReader = &fakeProfileReader{profile: &settingsmodels.AgentProfile{ID: "p1", AgentID: "a1"}}
++	prepared := &LaunchRequest{TaskDescription: "User task"}
++
++	mgr.runSkillDeploy(context.Background(), &LaunchRequest{AgentProfileID: "p1"}, prepared)
++
++	if got := prepared.TaskDescription; got != "User task" {
++		t.Fatalf("TaskDescription = %q", got)
++	}
++}
++
++func TestRunSkillDeploy_OfficePromptDoesNotDuplicateEntryInstruction(t *testing.T) {
++	mgr := newSkillDeployTestManager(t)
++	entry := "# Managed instructions"
++	rec := &recordingDeployer{result: SkillDeployResult{EntryInstruction: &entry}}
++	mgr.skillDeployer = rec
++	mgr.agentProfileReader = &fakeProfileReader{profile: &settingsmodels.AgentProfile{ID: "p1", AgentID: "a1"}}
++	prepared := &LaunchRequest{TaskDescription: "# Managed instructions\n\nOffice task"}
++
++	mgr.runSkillDeploy(context.Background(), &LaunchRequest{AgentProfileID: "p1", McpMode: "office"}, prepared)
++
++	if got := prepared.TaskDescription; got != "# Managed instructions\n\nOffice task" {
++		t.Fatalf("Office TaskDescription was changed: %q", got)
++	}
++}
++
+ // TestRunSkillDeploy_RichProfileInvokesDeployer verifies the deployer fires
+ // when the profile carries any of skill_ids or desired_skills.
+ func TestRunSkillDeploy_RichProfileInvokesDeployer(t *testing.T) {
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deployer.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deployer.go
+index a8cd0c4..0571aa3 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deployer.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deployer.go
+@@ -39,11 +39,12 @@ type SkillDeployRequest struct {
+ //   - Metadata: per-executor metadata keys (e.g. kandev_runtime_dir for
+ //     Docker bind-mounts, skill_manifest_json for Sprites uploads).
+ //   - InstructionsDir: the on-host or sprite-side path where instruction
+-//     files were materialised. Office's prompt builder reads from this
+-//     path; kanban launches that don't consume instructions can ignore it.
++//     files were materialised.
++//   - EntryInstruction: the effective entry instruction to prepend to a fresh non-Office ACP prompt; non-nil empty content is an intentional profile override.
+ type SkillDeployResult struct {
+-	Metadata        map[string]any
+-	InstructionsDir string
++	Metadata         map[string]any
++	InstructionsDir  string
++	EntryInstruction *string
+ }
+ 
+ // AgentProfileReader is the minimal surface SkillDeployer implementations and
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deployer_adapter.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deployer_adapter.go
+index 5f84c2f..d9cbc47 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deployer_adapter.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deployer_adapter.go
+@@ -45,7 +45,8 @@ func (a *skillDeployerAdapter) DeploySkills(ctx context.Context, req SkillDeploy
+ 		return SkillDeployResult{}, err
+ 	}
+ 	return SkillDeployResult{
+-		Metadata:        res.Metadata,
+-		InstructionsDir: res.InstructionsDir,
++		Metadata:         res.Metadata,
++		InstructionsDir:  res.InstructionsDir,
++		EntryInstruction: res.EntryInstruction,
+ 	}, nil
+ }
+

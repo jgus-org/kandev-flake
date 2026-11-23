@@ -1,0 +1,145 @@
+diff --git a/apps/backend/internal/mcp/server/ask_user_question_test.go b/apps/backend/internal/mcp/server/ask_user_question_test.go
+index 6a8eccb..d1e8e5b 100644
+--- a/apps/backend/internal/mcp/server/ask_user_question_test.go
++++ b/apps/backend/internal/mcp/server/ask_user_question_test.go
+@@ -324,6 +324,65 @@ func TestAskUserQuestion_RejectionPath(t *testing.T) {
+ 	assert.Contains(t, textBlock.Text, "User skipped")
+ }
+ 
++// silentAskBackend never answers a question bundle: it waits for the caller's own
++// deadline and records the clarification-timeout notification that must follow.
++type silentAskBackend struct {
++	clarificationTimeout chan string
++}
++
++func (b *silentAskBackend) RequestPayload(ctx context.Context, action string, _, _ interface{}) error {
++	switch action {
++	case ws.ActionMCPAskUserQuestion:
++		<-ctx.Done()
++		return ctx.Err()
++	case ws.ActionMCPClarificationTimeout:
++		b.clarificationTimeout <- action
++	}
++	return nil
++}
++
++// TestAskUserQuestion_ExpiresInsideTheClientDeadline covers the case where nobody
++// answers: the tool call must finish on Kandev's clock with every question
++// unanswered, and the pending question must be handed to the clarification-timeout
++// path so a late answer still reaches the agent. Letting the agent's MCP client
++// abort the in-flight call instead tears the tool down while its server is still
++// registered, which is how a session loses the Kandev tools permanently.
++func TestAskUserQuestion_ExpiresInsideTheClientDeadline(t *testing.T) {
++	backend := &silentAskBackend{clarificationTimeout: make(chan string)}
++	s := newTaskModeServer(t, backend, "task-current")
++
++	prev := askQuestionMaxWait
++	askQuestionMaxWait = time.Minute
++	t.Cleanup(func() { askQuestionMaxWait = prev })
++
++	args := map[string]interface{}{
++		"questions": []map[string]interface{}{
++			{
++				"id":     "q1",
++				"prompt": "Which?",
++				"options": []map[string]interface{}{
++					{"label": "Yes", "description": "y"},
++					{"label": "No", "description": "n"},
++				},
++			},
++		},
++	}
++
++	var result *mcplib.CallToolResult
++	synctest.Test(t, func(t *testing.T) {
++		result = callTool(t, s, "ask_user_question_kandev", args)
++		assert.Equal(t, ws.ActionMCPClarificationTimeout, <-backend.clarificationTimeout)
++	})
++
++	require.False(t, result.IsError, "an unanswered question must complete the call, not abort it")
++	textBlock, ok := result.Content[0].(mcplib.TextContent)
++	require.True(t, ok)
++	var parsed map[string]interface{}
++	require.NoError(t, json.Unmarshal([]byte(textBlock.Text), &parsed))
++	assert.Equal(t, true, parsed[timedOutFieldKey])
++	assert.Equal(t, false, parsed["q1"].(map[string]interface{})[answeredFieldKey])
++}
++
+ // TestEmitKeepAlivePings_TicksUntilStop verifies the keepalive loop fires send on
+ // each interval and exits once the stop channel closes.
+ func TestEmitKeepAlivePings_TicksUntilStop(t *testing.T) {
+diff --git a/apps/backend/internal/mcp/server/handlers.go b/apps/backend/internal/mcp/server/handlers.go
+index 7ba1c80..a083047 100644
+--- a/apps/backend/internal/mcp/server/handlers.go
++++ b/apps/backend/internal/mcp/server/handlers.go
+@@ -23,6 +23,19 @@ import (
+ // responds. Declared as a var so tests can shorten it.
+ var askQuestionKeepAliveInterval = 20 * time.Second
+ 
++// askQuestionMaxWait bounds how long ask_user_question holds the agent's tool call
++// open waiting for the user's answer. Progress notifications reset the agent MCP
++// client's idle timer, but a client also imposes an absolute deadline on one
++// request (Qwen Code: 600s) that no notification can reset; when the client aborts
++// the in-flight call, the tool is torn down while its server is still registered,
++// and a client that rediscovers tools can lose the Kandev tools for the rest of the
++// session. Expiring first keeps the outcome in Kandev's hands: the call completes
++// with every question unanswered and the pending question moves to the
++// clarification-timeout path, where a late answer still reaches the agent as a new
++// turn. Must stay inside the shortest absolute per-request deadline of any supported
++// client. Declared as a var so tests can shorten it.
++var askQuestionMaxWait = 9 * time.Minute
++
+ // Argument-name constants used across the ask_user_question_kandev handler.
+ // Pulled out so goconst stays happy and renames stay safe.
+ const (
+@@ -37,6 +50,7 @@ const (
+ 	questionIDFieldKey   = "question_id"
+ 	answeredFieldKey     = "answered"
+ 	rejectedFieldKey     = "rejected"
++	timedOutFieldKey     = "timed_out"
+ 	documentArg          = "document"
+ 	messageArg           = "message"
+ 	autopilotArg         = "autopilot"
+@@ -667,7 +681,16 @@ func (s *Server) askUserQuestionHandler() server.ToolHandlerFunc {
+ 		// Use the MCP request context from the agent. This ensures that if the agent's
+ 		// MCP client times out, we'll detect it and not update the session state.
+ 		var result map[string]interface{}
+-		if err := s.backend.RequestPayload(ctx, ws.ActionMCPAskUserQuestion, payload, &result); err != nil {
++		waitCtx, cancelWait := context.WithTimeout(ctx, askQuestionMaxWait)
++		defer cancelWait()
++		if err := s.backend.RequestPayload(waitCtx, ws.ActionMCPAskUserQuestion, payload, &result); err != nil {
++			if waitCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
++				// Nobody answered inside askQuestionMaxWait while the agent is still
++				// connected: reuse the disconnect path so a late answer is still
++				// delivered, and answer the agent before its client gives up on the call.
++				go s.notifyClarificationTimeout()
++				return clarificationTimedOut(questions), nil
++			}
+ 			if ctx.Err() != nil {
+ 				// Agent's MCP client disconnected/timed out. Notify backend to cancel
+ 				// pending clarifications so the user's answer goes through the event
+@@ -928,6 +951,24 @@ func extractQuestionAnswers(result map[string]interface{}, questions []map[strin
+ 	return mcp.NewToolResultStructured(out, string(data))
+ }
+ 
++// clarificationTimedOut answers a question bundle that nobody replied to inside
++// askQuestionMaxWait. The result keeps the shape the agent already parses, with
++// every question reported unanswered, so the tool call finishes instead of being
++// aborted by the agent's client.
++func clarificationTimedOut(questions []map[string]interface{}) *mcp.CallToolResult {
++	out := make(map[string]interface{}, len(questions)+1)
++	out[timedOutFieldKey] = true
++	for _, q := range questions {
++		qid, _ := q[idArg].(string)
++		if qid == "" {
++			continue
++		}
++		out[qid] = map[string]interface{}{answeredFieldKey: false}
++	}
++	data, _ := json.MarshalIndent(out, "", "  ")
++	return mcp.NewToolResultStructured(out, string(data))
++}
++
+ // simplifyAnswer normalizes the answer map. Single-choice per question, but
+ // the user can also type a custom text alongside an option pick — we preserve
+ // both fields so the agent gets the full context. When the bundle was

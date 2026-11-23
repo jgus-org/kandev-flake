@@ -1,0 +1,420 @@
+diff --git a/web/components/task/passthrough-terminal.tsx b/web/components/task/passthrough-terminal.tsx
+index 8e7ecc7..7538f9a 100644
+--- a/web/components/task/passthrough-terminal.tsx
++++ b/web/components/task/passthrough-terminal.tsx
+@@ -301,6 +301,7 @@ type PassthroughEffectsOptions = {
+   wsBaseUrl: string;
+   resolvedTheme: ReturnType<typeof useTheme>["resolvedTheme"];
+   connection: PassthroughConnectionState;
++  onTerminalGone?: () => void;
+ };
+ 
+ function usePassthroughEffects({
+@@ -314,6 +315,7 @@ function usePassthroughEffects({
+   wsBaseUrl,
+   resolvedTheme,
+   connection,
++  onTerminalGone,
+ }: PassthroughEffectsOptions) {
+   const {
+     mode,
+@@ -398,6 +400,7 @@ function usePassthroughEffects({
+     onDisconnected,
+     manualInputRouting,
+     onWsReady,
++    onTerminalGone,
+   });
+   usePendingCommand(pendingCommand, isConnected, wsRef, onCommandSent);
+   return { containerRef, search, isConnected };
+@@ -417,7 +420,17 @@ export function PassthroughTerminal(props: PassthroughTerminalProps) {
+   const taskId = session?.task_id ?? null;
+   const connectionID = mode === "agent" ? sessionId : environmentId;
+   const environmentEnded = useEnvironmentEnded(environmentId);
+-  const canConnect = computeCanConnect(mode, connectionID, sessionId, environmentEnded);
++  // Set when the gone-probe confirms the environment's session has ended even
++  // though the store has not caught up (a stale or pruned projection). Sticky per
++  // terminal target so a later store refresh cannot restart the reconnect loop;
++  // cleared when the tab switches to a different target.
++  const [terminalGone, setTerminalGone] = useState(false);
++  useEffect(() => {
++    setTerminalGone(false);
++  }, [connectionID]);
++  const onTerminalGone = useCallback(() => setTerminalGone(true), []);
++  const ended = environmentEnded || terminalGone;
++  const canConnect = computeCanConnect(mode, connectionID, sessionId, ended);
+   const wsBaseUrl = useWsBaseUrl();
+   const connection = usePassthroughConnection({
+     connectionID,
+@@ -427,7 +440,7 @@ export function PassthroughTerminal(props: PassthroughTerminalProps) {
+     attachAddonRef,
+     wsRef,
+   });
+-  const paneState = computeTerminalPaneState(mode, environmentEnded, connection.isConnected);
++  const paneState = computeTerminalPaneState(mode, ended, connection.isConnected);
+   const { containerRef, search } = usePassthroughEffects({
+     props,
+     refs,
+@@ -439,6 +452,7 @@ export function PassthroughTerminal(props: PassthroughTerminalProps) {
+     wsBaseUrl,
+     resolvedTheme,
+     connection,
++    onTerminalGone,
+   });
+ 
+   return (
+diff --git a/web/components/task/use-passthrough-terminal.test.ts b/web/components/task/use-passthrough-terminal.test.ts
+index 38ac9f6..21fd8f7 100644
+--- a/web/components/task/use-passthrough-terminal.test.ts
++++ b/web/components/task/use-passthrough-terminal.test.ts
+@@ -1,5 +1,9 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { buildTerminalWsUrl } from "./use-passthrough-terminal";
++import {
++  buildTerminalProbeUrl,
++  buildTerminalWsUrl,
++  probeTerminalGone,
++} from "./use-passthrough-terminal";
+ import {
+   computeCanConnect,
+   computeTerminalPaneState,
+@@ -104,6 +108,37 @@ describe("buildTerminalWsUrl", () => {
+   });
+ });
+ 
++describe("buildTerminalProbeUrl", () => {
++  it("maps the terminal WebSocket URL to its http(s) twin", () => {
++    expect(
++      buildTerminalProbeUrl("wss://kandev.example", {
++        mode: "shell",
++        environmentId: "env-1",
++        terminalId: "terminal with spaces",
++      }),
++    ).toBe(
++      "https://kandev.example/terminal/environment/env-1?terminalId=terminal%20with%20spaces",
++    );
++  });
++});
++
++describe("probeTerminalGone", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("reports gone only on 410, the status the backend returns for a terminal session", async () => {
++    const fetchMock = vi
++      .fn()
++      .mockResolvedValue(new Response("", { status: 410 }));
++    vi.stubGlobal("fetch", fetchMock);
++    expect(await probeTerminalGone("https://kandev.example/terminal/environment/env-1")).toBe(true);
++
++    fetchMock.mockResolvedValue(new Response("", { status: 503 }));
++    expect(await probeTerminalGone("https://kandev.example/terminal/environment/env-1")).toBe(false);
++  });
++});
++
+ describe("startReconnectLoop", () => {
+   afterEach(() => {
+     vi.useRealTimers();
+@@ -177,6 +212,115 @@ describe("startReconnectLoop", () => {
+     expect(terminal.reset).toHaveBeenCalledTimes(2);
+     stop();
+   });
++
++  it("stops reconnecting when the gone-probe reports the environment ended", async () => {
++    vi.useFakeTimers();
++
++    const onTerminalGone = vi.fn();
++    const checkGone = vi.fn(async () => true);
++    const connectWebSocket = vi.fn(({ onSocketClose }) => {
++      onSocketClose({ code: 1006 } as CloseEvent);
++    });
++
++    const stop = startReconnectLoop({
++      environmentId: "env-1",
++      wsBaseUrl: WS_BASE_URL,
++      mode: "shell",
++      terminalId: "shell-1",
++      label: undefined,
++      terminal: { reset: vi.fn() } as unknown as Terminal,
++      fitAndResize: vi.fn(),
++      wsRef: { current: null },
++      attachAddonRef: { current: null },
++      onConnected: vi.fn(),
++      onDisconnected: vi.fn(),
++      connectWebSocket,
++      checkGone,
++      onTerminalGone,
++    });
++
++    await vi.advanceTimersByTimeAsync(150);
++
++    expect(connectWebSocket).toHaveBeenCalledTimes(1);
++    expect(checkGone).toHaveBeenCalledTimes(1);
++    expect(onTerminalGone).toHaveBeenCalledTimes(1);
++
++    // Gone is permanent: the loop must stay stopped, not schedule another attempt.
++    await vi.advanceTimersByTimeAsync(60_000);
++    expect(connectWebSocket).toHaveBeenCalledTimes(1);
++    expect(checkGone).toHaveBeenCalledTimes(1);
++    stop();
++  });
++
++  it("keeps reconnecting while the gone-probe reports a transient failure", async () => {
++    vi.useFakeTimers();
++
++    const onTerminalGone = vi.fn();
++    const checkGone = vi.fn(async () => false);
++    const connectWebSocket = vi.fn(({ onSocketClose }) => {
++      onSocketClose({ code: 1006 } as CloseEvent);
++    });
++
++    const stop = startReconnectLoop({
++      environmentId: "env-1",
++      wsBaseUrl: WS_BASE_URL,
++      mode: "shell",
++      terminalId: "shell-1",
++      label: undefined,
++      terminal: { reset: vi.fn() } as unknown as Terminal,
++      fitAndResize: vi.fn(),
++      wsRef: { current: null },
++      attachAddonRef: { current: null },
++      onConnected: vi.fn(),
++      onDisconnected: vi.fn(),
++      connectWebSocket,
++      checkGone,
++      onTerminalGone,
++    });
++
++    await vi.advanceTimersByTimeAsync(150);
++    expect(checkGone).toHaveBeenCalledTimes(1);
++    expect(onTerminalGone).not.toHaveBeenCalled();
++
++    await vi.advanceTimersByTimeAsync(300);
++    expect(connectWebSocket).toHaveBeenCalledTimes(2);
++    stop();
++  });
++
++  it("does not probe a terminal that opened and then dropped", async () => {
++    vi.useFakeTimers();
++
++    const checkGone = vi.fn(async () => true);
++    const connectWebSocket = vi.fn(({ onConnected, onSocketClose }) => {
++      onConnected();
++      onSocketClose({ code: 1006 } as CloseEvent);
++    });
++
++    const stop = startReconnectLoop({
++      environmentId: "env-1",
++      wsBaseUrl: WS_BASE_URL,
++      mode: "shell",
++      terminalId: "shell-1",
++      label: undefined,
++      terminal: { reset: vi.fn() } as unknown as Terminal,
++      fitAndResize: vi.fn(),
++      wsRef: { current: null },
++      attachAddonRef: { current: null },
++      onConnected: vi.fn(),
++      onDisconnected: vi.fn(),
++      connectWebSocket,
++      checkGone,
++      onTerminalGone: vi.fn(),
++    });
++
++    await vi.advanceTimersByTimeAsync(150);
++
++    // A connection that reached OPEN then closed is an ordinary disconnect; the
++    // loop just retries without consulting the gone-probe.
++    expect(connectWebSocket).toHaveBeenCalledTimes(1);
++    expect(checkGone).not.toHaveBeenCalled();
++    stop();
++  });
+ });
+ 
+ // The env handler refuses a shell on an ended session, identically every time.
+diff --git a/web/components/task/use-passthrough-terminal.ts b/web/components/task/use-passthrough-terminal.ts
+index 3d8e291..a532095 100644
+--- a/web/components/task/use-passthrough-terminal.ts
++++ b/web/components/task/use-passthrough-terminal.ts
+@@ -343,6 +343,10 @@ export type WebSocketConnectionOptions = {
+   /** Fires when the WebSocket reaches the OPEN state. Use to register a sender
+    * that bypasses xterm.onData (mobile key-bar registry). */
+   onWsReady?: (ws: WebSocket) => void;
++  /** Fires once when the shell-terminal gone-probe reports the target is gone, so
++   * the caller can stop reconnecting and show an ended terminal instead of an
++   * infinite retry loop. */
++  onTerminalGone?: () => void;
+ };
+ 
+ export function buildTerminalWsUrl(
+@@ -369,6 +373,31 @@ export function buildTerminalWsUrl(
+   return wsUrl;
+ }
+ 
++/**
++ * The http(s) twin of {@link buildTerminalWsUrl}. A browser cannot read the HTTP
++ * status of a failed WebSocket handshake, so the terminal client probes this URL
++ * to learn whether the target is permanently gone (410) rather than transiently
++ * not-ready (503). The backend short-circuits a non-upgrade GET to a readiness
++ * response, so this never disturbs a live terminal.
++ */
++export function buildTerminalProbeUrl(
++  wsBaseUrl: string,
++  params: Parameters<typeof buildTerminalWsUrl>[1],
++): string {
++  const httpBase = wsBaseUrl.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
++  return buildTerminalWsUrl(httpBase, params);
++}
++
++/** True when the probe reports the terminal target is permanently gone. */
++export async function probeTerminalGone(probeUrl: string): Promise<boolean> {
++  const response = await fetch(probeUrl, {
++    method: "GET",
++    credentials: "same-origin",
++    headers: { Accept: "application/json" },
++  });
++  return response.status === 410;
++}
++
+ type ConnectWebSocketOptions = {
+   sessionId?: string;
+   environmentId?: string;
+@@ -499,6 +528,7 @@ export function useWebSocketConnection({
+   onDisconnected,
+   manualInputRouting,
+   onWsReady,
++  onTerminalGone,
+ }: WebSocketConnectionOptions) {
+   const taskIdRef = useRef(taskId);
+ 
+@@ -545,6 +575,23 @@ export function useWebSocketConnection({
+     log("Resetting terminal buffer for terminal target", connectionKey);
+     terminal.reset();
+ 
++    // Only a shell terminal can be ended out from under an open tab, and a
++    // browser cannot read the HTTP status of the failed WebSocket handshake, so
++    // probe over plain HTTP to tell a permanently-ended environment from a
++    // transient one. Absent for agent terminals, which keep the prior behavior.
++    const checkGone =
++      mode === "shell" && environmentId && terminalId
++        ? () =>
++            probeTerminalGone(
++              buildTerminalProbeUrl(wsBaseUrl, {
++                mode,
++                environmentId: environmentId ?? undefined,
++                terminalId,
++                label,
++              }),
++            )
++        : undefined;
++
+     const stopReconnectLoop = startReconnectLoop({
+       sessionId: sessionId ?? undefined,
+       environmentId: environmentId ?? undefined,
+@@ -561,6 +608,8 @@ export function useWebSocketConnection({
+       connectWebSocket,
+       manualInputRouting,
+       onWsReady,
++      checkGone,
++      onTerminalGone,
+     });
+     return () => teardownWebSocket(stopReconnectLoop, attachAddonRef, wsRef);
+     // eslint-disable-next-line react-hooks/exhaustive-deps -- manualInputRouting/onWsReady should not retrigger reconnect
+diff --git a/web/components/task/ws-reconnect.ts b/web/components/task/ws-reconnect.ts
+index f930475..00fd708 100644
+--- a/web/components/task/ws-reconnect.ts
++++ b/web/components/task/ws-reconnect.ts
+@@ -65,6 +65,16 @@ export type ReconnectLoopOptions = {
+   connectWebSocket: ConnectWebSocketFn;
+   manualInputRouting?: boolean;
+   onWsReady?: (ws: WebSocket) => void;
++  /**
++   * Resolves true when the terminal target is permanently gone. The browser never
++   * exposes the HTTP status of a failed WebSocket handshake, so a handshake that
++   * never opened cannot tell a transient failure from a terminal one on its own;
++   * callers supply an out-of-band check. When it reports the target ended, the
++   * loop stops instead of retrying forever.
++   */
++  checkGone?: () => Promise<boolean>;
++  /** Fires once, when `checkGone` confirms the target is permanently gone. */
++  onTerminalGone?: () => void;
+ };
+ 
+ export function startReconnectLoop({
+@@ -83,12 +93,25 @@ export function startReconnectLoop({
+   connectWebSocket,
+   manualInputRouting,
+   onWsReady,
++  checkGone,
++  onTerminalGone,
+ }: ReconnectLoopOptions): () => void {
+   let isMounted = true;
+   let connectTimeout: ReturnType<typeof setTimeout> | null = null;
+   let settleTimeout: ReturnType<typeof setTimeout> | null = null;
+   let stableOpenTimeout: ReturnType<typeof setTimeout> | null = null;
+   let retryAttempt = 0;
++  // Whether the current attempt reached OPEN. A close without ever opening is a
++  // handshake failure (the backend refused before upgrading), which is what the
++  // gone-probe distinguishes; a close after OPEN is an ordinary disconnect.
++  let openedThisAttempt = false;
++
++  const scheduleReconnect = (code: number) => {
++    const nextDelay = reconnectDelayMs(retryAttempt);
++    retryAttempt += 1;
++    log("Scheduling reconnect", { attempt: retryAttempt, delayMs: nextDelay, code });
++    scheduleConnect(nextDelay);
++  };
+ 
+   const scheduleConnect = (delayMs: number) => {
+     if (!isMounted) return;
+@@ -99,6 +122,7 @@ export function startReconnectLoop({
+       // reconnects. Clear the existing xterm contents first so replay replaces
+       // the visible terminal instead of appending duplicate prompt lines.
+       terminal.reset();
++      openedThisAttempt = false;
+       connectWebSocket({
+         sessionId,
+         environmentId,
+@@ -117,6 +141,7 @@ export function startReconnectLoop({
+           settleTimeout = id;
+         },
+         onConnected: () => {
++          openedThisAttempt = true;
+           if (stableOpenTimeout) clearTimeout(stableOpenTimeout);
+           stableOpenTimeout = setTimeout(() => {
+             retryAttempt = 0;
+@@ -131,14 +156,27 @@ export function startReconnectLoop({
+             clearTimeout(stableOpenTimeout);
+             stableOpenTimeout = null;
+           }
+-          const nextDelay = reconnectDelayMs(retryAttempt);
+-          retryAttempt += 1;
+-          log("Scheduling reconnect", {
+-            attempt: retryAttempt,
+-            delayMs: nextDelay,
+-            code: event.code,
+-          });
+-          scheduleConnect(nextDelay);
++          // Only a handshake that never opened can be a permanent end. Probe
++          // out-of-band; if the target is gone, stop rather than retry forever.
++          if (!openedThisAttempt && checkGone) {
++            void (async () => {
++              let gone = false;
++              try {
++                gone = await checkGone();
++              } catch {
++                gone = false;
++              }
++              if (!isMounted) return;
++              if (gone) {
++                log("Terminal target is gone; stopping reconnect loop");
++                onTerminalGone?.();
++                return;
++              }
++              scheduleReconnect(event.code);
++            })();
++            return;
++          }
++          scheduleReconnect(event.code);
+         },
+       });
+     }, delayMs);

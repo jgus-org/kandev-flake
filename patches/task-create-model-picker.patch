@@ -1,0 +1,551 @@
+diff --git a/web/components/task-create-dialog-create-mode-selectors.tsx b/web/components/task-create-dialog-create-mode-selectors.tsx
+index 1793749..6004962 100644
+--- a/web/components/task-create-dialog-create-mode-selectors.tsx
++++ b/web/components/task-create-dialog-create-mode-selectors.tsx
+@@ -5,8 +5,10 @@ import type { DialogFormState } from "@/components/task-create-dialog-types";
+ import { CreateEditSelectors } from "@/components/task-create-dialog-form-body";
+ import { AgentSelector, ExecutorProfileSelector } from "@/components/task-create-dialog-selectors";
+ import { useAgentProfileOptions } from "@/components/task-create-dialog-options";
++import { TaskCreateModelSelector } from "@/components/task-create-model-selector";
+ 
+ type CreateModeSelectorsProps = {
++  isCreateMode: boolean;
+   isTaskStarted: boolean;
+   agentProfileOptions: ReturnType<typeof useAgentProfileOptions>;
+   executorProfileOptions: Array<{
+@@ -20,6 +22,10 @@ type CreateModeSelectorsProps = {
+   isCreatingSession: boolean;
+   fs: DialogFormState;
+   onAgentProfileChange: (v: string) => void;
++  initialModel?: string;
++  onInitialModelChange?: (v: string) => void;
++  initialConfigOptions?: Record<string, string>;
++  onInitialConfigOptionsChange?: (options: Record<string, string>) => void;
+   onExecutorProfileChange: (v: string) => void;
+   workflowAgentLocked: boolean;
+   noCompatibleAgent: boolean;
+@@ -32,6 +38,25 @@ type CreateModeSelectorsProps = {
+  * description (RepoChipsRow).
+  */
+ export function CreateModeSelectors(props: CreateModeSelectorsProps) {
++  const modelSelector = props.isCreateMode && props.onInitialModelChange ? (
++    <TaskCreateModelSelector
++      agentProfiles={props.agentProfiles}
++      agentProfileId={props.fs.agentProfileId}
++      value={props.fs.agentProfileId ? (props.initialModel ?? "") : ""}
++      onValueChange={props.onInitialModelChange}
++      configOptionsValue={props.initialConfigOptions}
++      onConfigOptionChange={
++        props.onInitialConfigOptionsChange
++          ? (configId, optionValue) => {
++              const next = { ...(props.initialConfigOptions ?? {}) };
++              next[configId] = optionValue;
++              props.onInitialConfigOptionsChange?.(next);
++            }
++          : undefined
++      }
++      disabled={props.isCreatingSession}
++    />
++  ) : undefined;
+   return (
+     <CreateEditSelectors
+       isTaskStarted={props.isTaskStarted}
+@@ -50,6 +75,7 @@ export function CreateModeSelectors(props: CreateModeSelectorsProps) {
+       executorProfileName={props.executorProfileName}
+       AgentSelectorComponent={AgentSelector}
+       ExecutorProfileSelectorComponent={ExecutorProfileSelector}
++      modelSelector={modelSelector}
+     />
+   );
+ }
+diff --git a/web/components/task-create-dialog-form-body.tsx b/web/components/task-create-dialog-form-body.tsx
+index 57ae72c..1f7e447 100644
+--- a/web/components/task-create-dialog-form-body.tsx
++++ b/web/components/task-create-dialog-form-body.tsx
+@@ -58,6 +58,7 @@ type CreateEditSelectorsProps = {
+   workflowAgentLocked: boolean;
+   noCompatibleAgent: boolean;
+   executorProfileName: string | null;
++  modelSelector?: React.ReactNode;
+ };
+ 
+ type AgentColumnProps = Pick<
+@@ -170,10 +171,13 @@ export const CreateEditSelectors = memo(function CreateEditSelectors(
+   // branch strategy) live in the chip row above the description; this row
+   // carries only agent and executor profile selectors.
+   return (
+-    <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2">
++    <div
++      className={`grid min-w-0 grid-cols-1 gap-4 ${props.modelSelector ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}
++    >
+       <div className="min-w-0">
+         <AgentColumn {...props} />
+       </div>
++      {props.modelSelector ? <div className="min-w-0">{props.modelSelector}</div> : null}
+       <div className="min-w-0">
+         <ExecutorProfileSelectorComponent
+           options={executorProfileOptions}
+diff --git a/web/components/task-create-dialog-helpers.test.ts b/web/components/task-create-dialog-helpers.test.ts
+index adc6ed9..96cba86 100644
+--- a/web/components/task-create-dialog-helpers.test.ts
++++ b/web/components/task-create-dialog-helpers.test.ts
+@@ -109,6 +109,52 @@ describe("autoSelectBranch", () => {
+   });
+ });
+ 
++describe("buildCreateTaskPayload", () => {
++  it("sends an explicitly selected initial model", () => {
++    expect(
++      buildCreateTaskPayload({
++        ...AGENT_PAYLOAD_DEFAULTS,
++        trimmedTitle: "Task",
++        trimmedDescription: "Prompt",
++        initialModel: "model-2",
++      }),
++    ).toEqual(expect.objectContaining({ initial_model: "model-2" }));
++  });
++
++  it("sends explicitly selected initial config options", () => {
++    expect(
++      buildCreateTaskPayload({
++        ...AGENT_PAYLOAD_DEFAULTS,
++        trimmedTitle: "Task",
++        trimmedDescription: "Prompt",
++        initialConfigOptions: { reasoning_effort: "high" },
++      }),
++    ).toEqual(
++      expect.objectContaining({ initial_config_options: { reasoning_effort: "high" } }),
++    );
++  });
++
++  it("omits empty initial config options", () => {
++    const payload = buildCreateTaskPayload({
++      ...AGENT_PAYLOAD_DEFAULTS,
++      trimmedTitle: "Task",
++      trimmedDescription: "Prompt",
++      initialConfigOptions: {},
++    });
++    expect(JSON.stringify(payload)).not.toContain("initial_config_options");
++  });
++
++  it("inherits the profile model when no override is selected", () => {
++    const payload = buildCreateTaskPayload({
++      ...AGENT_PAYLOAD_DEFAULTS,
++      trimmedTitle: "Task",
++      trimmedDescription: "Prompt",
++    });
++    expect(payload.initial_model).toBeUndefined();
++    expect(JSON.stringify(payload)).not.toContain("initial_model");
++  });
++});
++
+ describe("shouldShowTaskTitleField", () => {
+   it.each([
+     {
+diff --git a/web/components/task-create-dialog-helpers.ts b/web/components/task-create-dialog-helpers.ts
+index af91055..47de0ef 100644
+--- a/web/components/task-create-dialog-helpers.ts
++++ b/web/components/task-create-dialog-helpers.ts
+@@ -159,6 +159,8 @@ export type BuildCreatePayloadArgs = {
+   autoTitle?: boolean;
+   repositoriesPayload: CreateTaskParams["repositories"];
+   agentProfileId: string;
++  initialModel?: string;
++  initialConfigOptions?: Record<string, string>;
+   executorId: string;
+   executorProfileId: string;
+   withAgent: boolean;
+@@ -182,6 +184,11 @@ export function buildCreateTaskPayload(args: BuildCreatePayloadArgs): CreateTask
+     start_agent: args.withAgent ? true : undefined,
+     prepare_session: args.withAgent ? undefined : true,
+     agent_profile_id: args.agentProfileId || undefined,
++    initial_model: args.initialModel || undefined,
++    initial_config_options:
++      args.initialConfigOptions && Object.keys(args.initialConfigOptions).length > 0
++        ? args.initialConfigOptions
++        : undefined,
+     executor_id: args.executorId || undefined,
+     executor_profile_id: args.executorProfileId || undefined,
+     plan_mode: args.planMode || undefined,
+diff --git a/web/components/task-create-dialog-prop-builders.ts b/web/components/task-create-dialog-prop-builders.ts
+index 24b95ce..e3eb3bc 100644
+--- a/web/components/task-create-dialog-prop-builders.ts
++++ b/web/components/task-create-dialog-prop-builders.ts
+@@ -57,6 +57,10 @@ export function buildDialogFormBodyProps(
+     fs,
+     handleKeyDown: setup.handleKeyDown,
+     onAgentProfileChange: handlers.handleAgentProfileChange,
++    initialModel: setup.initialModel,
++    onInitialModelChange: setup.handleInitialModelChange,
++    initialConfigOptions: setup.initialConfigOptions,
++    onInitialConfigOptionsChange: setup.setInitialConfigOptions,
+     onExecutorProfileChange: handlers.handleExecutorProfileChange,
+     onWorkflowChange: handlers.handleWorkflowChange,
+     onToggleRemote: repoLocked ? undefined : handlers.handleToggleRemote,
+diff --git a/web/components/task-create-dialog-setup.ts b/web/components/task-create-dialog-setup.ts
+index 8a370c7..297bad1 100644
+--- a/web/components/task-create-dialog-setup.ts
++++ b/web/components/task-create-dialog-setup.ts
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import { FormEvent, useCallback, useState } from "react";
++import { FormEvent, useCallback, useEffect, useState } from "react";
+ import type { JiraTicket } from "@/lib/types/jira";
+ import type { LinearIssue } from "@/lib/types/linear";
+ import type { Repository } from "@/lib/types/http";
+@@ -121,6 +121,7 @@ type SubmitWiringArgs = {
+   isSessionMode: boolean;
+   isEditMode: boolean;
+   autoTitle: boolean;
++  initialModel: string;
+   refreshBranchPolicies: () => Promise<void>;
+   preserveQueuedLastUsedOnClose: () => void;
+ };
+@@ -134,6 +135,7 @@ function useSubmitHandlersWiring({
+   isSessionMode,
+   isEditMode,
+   autoTitle,
++  initialModel,
+   refreshBranchPolicies,
+   preserveQueuedLastUsedOnClose,
+ }: SubmitWiringArgs) {
+@@ -166,6 +168,7 @@ function useSubmitHandlersWiring({
+     remoteRepos: fs.remoteRepos,
+     prInfoByUrl: fs.prInfoByUrl,
+     agentProfileId: computed.effectiveAgentProfileId,
++    initialModel,
+     executorId: fs.executorId,
+     executorProfileId: fs.executorProfileId,
+     editingTask,
+@@ -341,6 +344,16 @@ export function useTaskCreateDialogSetup(
+     repositoryLocalPath,
+     refreshBranchPolicies,
+   } = data;
++  const [initialModel, setInitialModel] = useState("");
++  const [initialConfigOptions, setInitialConfigOptions] = useState<Record<string, string>>({});
++  useEffect(() => {
++    setInitialModel("");
++    setInitialConfigOptions({});
++  }, [computed.effectiveAgentProfileId, open]);
++  const handleInitialModelChange = useCallback((model: string) => {
++    setInitialModel(model);
++    setInitialConfigOptions({});
++  }, []);
+   const submitHandlers = useSubmitHandlersWiring({
+     props: resolvedProps,
+     fs,
+@@ -350,6 +363,8 @@ export function useTaskCreateDialogSetup(
+     isSessionMode,
+     isEditMode,
+     autoTitle,
++    initialModel,
++    initialConfigOptions,
+     refreshBranchPolicies,
+     preserveQueuedLastUsedOnClose: options.preserveQueuedLastUsedOnClose ?? (() => undefined),
+   });
+@@ -376,6 +391,10 @@ export function useTaskCreateDialogSetup(
+   });
+   return {
+     fs,
++    initialModel,
++    handleInitialModelChange,
++    initialConfigOptions,
++    setInitialConfigOptions,
+     isSessionMode,
+     isEditMode,
+     isCreateMode: mode === "create",
+diff --git a/web/components/task-create-dialog-submit.tsx b/web/components/task-create-dialog-submit.tsx
+index f1dfe62..1600316 100644
+--- a/web/components/task-create-dialog-submit.tsx
++++ b/web/components/task-create-dialog-submit.tsx
+@@ -116,6 +116,8 @@ export function useTaskSubmitHandlers({
+   remoteRepos,
+   prInfoByUrl,
+   agentProfileId,
++  initialModel = "",
++  initialConfigOptions,
+   executorId,
+   executorProfileId,
+   editingTask,
+@@ -499,6 +501,8 @@ export function useTaskSubmitHandlers({
+           autoTitle,
+           repositoriesPayload: getRepositoriesPayload(c),
+           agentProfileId,
++          initialModel,
++          initialConfigOptions,
+           executorId,
+           executorProfileId,
+           withAgent: opts.withAgent,
+@@ -549,6 +553,8 @@ export function useTaskSubmitHandlers({
+       autoTitle,
+       blockedBy,
+       agentProfileId,
++      initialModel,
++      initialConfigOptions,
+       executorId,
+       executorProfileId,
+       isPassthroughProfile,
+@@ -786,6 +792,8 @@ export function useTaskSubmitHandlers({
+           autoTitle,
+           repositoriesPayload: getRepositoriesPayload(c),
+           agentProfileId,
++          initialModel,
++          initialConfigOptions,
+           executorId,
+           executorProfileId,
+           withAgent: false,
+@@ -821,6 +829,7 @@ export function useTaskSubmitHandlers({
+     workspaceId,
+     effectiveWorkflowId,
+     agentProfileId,
++    initialModel,
+     executorId,
+     executorProfileId,
+     noRepository,
+diff --git a/web/components/task-create-dialog-types.ts b/web/components/task-create-dialog-types.ts
+index e5d868f..9c9dd7d 100644
+--- a/web/components/task-create-dialog-types.ts
++++ b/web/components/task-create-dialog-types.ts
+@@ -464,6 +464,9 @@ export type SubmitHandlersDeps = {
+    */
+   prInfoByUrl: UsePRInfoByURLResult;
+   agentProfileId: string;
++  /** Optional model override applied only to the task's first session. */
++  initialModel?: string;
++  initialConfigOptions?: Record<string, string>;
+   executorId: string;
+   executorProfileId: string;
+   editingTask?: {
+@@ -569,6 +572,10 @@ export type DialogFormBodyProps = {
+   onRowBranchChange: (key: string, value: string) => void;
+   onRowPolicyChange?: (key: string, policyId: string, baseBranch: string) => void;
+   onAgentProfileChange: (v: string) => void;
++  initialModel?: string;
++  initialConfigOptions?: Record<string, string>;
++  onInitialModelChange?: (v: string) => void;
++  onInitialConfigOptionsChange?: (options: Record<string, string>) => void;
+   onExecutorProfileChange: (v: string) => void;
+   onWorkflowChange: (v: string) => void;
+   onToggleRemote?: () => void;
+diff --git a/web/components/task-create-dialog.tsx b/web/components/task-create-dialog.tsx
+index 3d790c3..d5a39c5 100644
+--- a/web/components/task-create-dialog.tsx
++++ b/web/components/task-create-dialog.tsx
+@@ -125,6 +125,7 @@ function CreateModeBody(props: DialogFormBodyProps) {
+ function CreateModeAgentSelectors(props: DialogFormBodyProps) {
+   return (
+     <CreateModeSelectors
++      isCreateMode={props.isCreateMode}
+       isTaskStarted={props.isTaskStarted}
+       agentProfileOptions={props.agentProfileOptions}
+       executorProfileOptions={props.executorProfileOptions}
+@@ -134,6 +135,10 @@ function CreateModeAgentSelectors(props: DialogFormBodyProps) {
+       isCreatingSession={props.isCreatingSession}
+       fs={props.fs}
+       onAgentProfileChange={props.onAgentProfileChange}
++      initialModel={props.initialModel}
++      onInitialModelChange={props.onInitialModelChange}
++      initialConfigOptions={props.initialConfigOptions}
++      onInitialConfigOptionsChange={props.onInitialConfigOptionsChange}
+       onExecutorProfileChange={props.onExecutorProfileChange}
+       workflowAgentLocked={props.workflowAgentLocked}
+       noCompatibleAgent={props.noCompatibleAgent}
+diff --git a/web/components/task-create-model-selector.test.ts b/web/components/task-create-model-selector.test.ts
+new file mode 100644
+index 0000000..69fa48f
+--- /dev/null
++++ b/web/components/task-create-model-selector.test.ts
+@@ -0,0 +1,68 @@
++import { describe, expect, it } from "vitest";
++import type { AgentProfileOption } from "@/lib/state/slices";
++import type { AvailableAgent } from "@/lib/types/http";
++import {
++  buildTaskCreateModelOptions,
++  PROFILE_DEFAULT_MODEL,
++  withSelectedConfigOptions,
++} from "./task-create-model-selector";
++
++const profile = {
++  id: "profile-1",
++  label: "Codex",
++  agent_id: "agent-1",
++  agent_name: "codex",
++  cli_passthrough: false,
++  model: "model-1",
++} satisfies AgentProfileOption;
++
++const availableAgent = {
++  name: "codex",
++  model_config: {
++    available_models: [
++      { id: "model-1", name: "Model One" },
++      { id: "model-2", name: "Model Two" },
++    ],
++  },
++} as AvailableAgent;
++
++describe("withSelectedConfigOptions", () => {
++  const configOptions = [
++    { type: "select", id: "model", name: "Model", currentValue: "model-1" },
++    { type: "select", id: "reasoning_effort", name: "Reasoning effort", currentValue: "medium" },
++  ];
++
++  it("returns provider options unchanged without selections", () => {
++    expect(withSelectedConfigOptions(configOptions, {})).toBe(configOptions);
++  });
++
++  it("overlays only the selected option values", () => {
++    expect(withSelectedConfigOptions(configOptions, { reasoning_effort: "high" })).toEqual([
++      { type: "select", id: "model", name: "Model", currentValue: "model-1" },
++      { type: "select", id: "reasoning_effort", name: "Reasoning effort", currentValue: "high" },
++    ]);
++  });
++});
++
++describe("buildTaskCreateModelOptions", () => {
++  it("offers profile inheritance before advertised models", () => {
++    expect(
++      buildTaskCreateModelOptions(profile, [availableAgent], "default", "Agent default"),
++    ).toEqual([
++      { id: PROFILE_DEFAULT_MODEL, name: "Model One (default)" },
++      { id: "model-1", name: "Model One", description: "model-1" },
++      { id: "model-2", name: "Model Two", description: "model-2" },
++    ]);
++  });
++
++  it("uses the agent default when the profile has no configured model", () => {
++    expect(
++      buildTaskCreateModelOptions(
++        { ...profile, model: undefined },
++        [availableAgent],
++        "default",
++        "Agent default",
++      )[0],
++    ).toEqual({ id: PROFILE_DEFAULT_MODEL, name: "Agent default" });
++  });
++});
+diff --git a/web/components/task-create-model-selector.tsx b/web/components/task-create-model-selector.tsx
+new file mode 100644
+index 0000000..fc63e4e
+--- /dev/null
++++ b/web/components/task-create-model-selector.tsx
+@@ -0,0 +1,105 @@
++"use client";
++
++import { useMemo } from "react";
++import { useTranslation } from "react-i18next";
++import {
++  ModelConfigSelector,
++  type DynamicConfigOption,
++  type ModelSelectorOption,
++} from "@/components/model-config-selector";
++import { useAvailableAgents } from "@/hooks/domains/settings/use-available-agents";
++import { useResolvedModelConfig } from "@/hooks/domains/settings/use-dynamic-models";
++import type { AgentProfileOption } from "@/lib/state/slices";
++import type { AvailableAgent } from "@/lib/types/http";
++
++export const PROFILE_DEFAULT_MODEL = "__kandev_profile_default__";
++
++export function buildTaskCreateModelOptions(
++  profile: AgentProfileOption | undefined,
++  availableAgents: AvailableAgent[],
++  defaultLabel: string,
++  agentDefaultLabel: string,
++): ModelSelectorOption[] {
++  if (!profile) return [];
++  const catalog = availableAgents.find((agent) => agent.name === profile.agent_name)?.model_config;
++  const models = catalog?.available_models ?? [];
++  const configured = models.find((model) => model.id === profile.model);
++  const inheritedName = profile.model
++    ? `${configured?.name ?? profile.model} (${defaultLabel})`
++    : agentDefaultLabel;
++  return [
++    { id: PROFILE_DEFAULT_MODEL, name: inheritedName },
++    ...models.map((model) => ({
++      id: model.id,
++      name: model.name,
++      description: model.description ?? (model.id !== model.name ? model.id : undefined),
++    })),
++  ];
++}
++
++export function withSelectedConfigOptions(
++  configOptions: DynamicConfigOption[],
++  selected: Record<string, string>,
++): DynamicConfigOption[] {
++  if (Object.keys(selected).length === 0) return configOptions;
++  return configOptions.map((option) =>
++    option.id in selected ? { ...option, currentValue: selected[option.id] } : option,
++  );
++}
++
++type TaskCreateModelSelectorProps = {
++  agentProfiles: AgentProfileOption[];
++  agentProfileId: string;
++  value: string;
++  onValueChange: (value: string) => void;
++  configOptionsValue?: Record<string, string>;
++  onConfigOptionChange?: (configId: string, value: string) => void;
++  disabled?: boolean;
++};
++
++export function TaskCreateModelSelector({
++  agentProfiles,
++  agentProfileId,
++  value,
++  onValueChange,
++  configOptionsValue,
++  onConfigOptionChange,
++  disabled,
++}: TaskCreateModelSelectorProps) {
++  const { t } = useTranslation();
++  const availableAgents = useAvailableAgents();
++  const profile = agentProfiles.find((item) => item.id === agentProfileId);
++  const modelOptions = useMemo(
++    () =>
++      buildTaskCreateModelOptions(
++        profile,
++        availableAgents.items,
++        t("common:default"),
++        t("task:modelSelectionProviderDefault"),
++      ),
++    [availableAgents.items, profile, t],
++  );
++  const resolvedModel = value || profile?.model;
++  const { configOptions, isLoading } = useResolvedModelConfig(
++    profile?.agent_name,
++    resolvedModel || undefined,
++    { enabled: !!profile },
++  );
++  const selectConfigOptions = useMemo(
++    () => withSelectedConfigOptions(configOptions, configOptionsValue ?? {}),
++    [configOptions, configOptionsValue],
++  );
++  const hasSelectableModel = modelOptions.length > 1;
++  return (
++    <ModelConfigSelector
++      modelOptions={modelOptions}
++      currentModel={value || PROFILE_DEFAULT_MODEL}
++      configOptions={selectConfigOptions}
++      onModelChange={(model) => onValueChange(model === PROFILE_DEFAULT_MODEL ? "" : model)}
++      onConfigChange={onConfigOptionChange}
++      configOptionsLoading={isLoading}
++      disabled={disabled || availableAgents.loading || !profile || !hasSelectableModel}
++      popoverAlign="start"
++    />
++  );
++}
+diff --git a/web/lib/api/domains/kanban-api.ts b/web/lib/api/domains/kanban-api.ts
+index c1c6949..52d4de2 100644
+--- a/web/lib/api/domains/kanban-api.ts
++++ b/web/lib/api/domains/kanban-api.ts
+@@ -90,6 +90,8 @@ export async function createTask(
+     start_agent?: boolean;
+     prepare_session?: boolean;
+     agent_profile_id?: string;
++    initial_model?: string;
++    initial_config_options?: Record<string, string>;
+     executor_id?: string;
+     executor_profile_id?: string;
+     plan_mode?: boolean;

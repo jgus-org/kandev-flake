@@ -1,0 +1,268 @@
+diff --git a/apps/backend/internal/task/handlers/task_create_initial_model.go b/apps/backend/internal/task/handlers/task_create_initial_model.go
+new file mode 100644
+index 0000000..c019ec6
+--- /dev/null
++++ b/apps/backend/internal/task/handlers/task_create_initial_model.go
+@@ -0,0 +1,44 @@
++package handlers
++
++import (
++	"errors"
++	"strings"
++
++	"github.com/kandev/kandev/internal/task/models"
++)
++
++var errInitialRuntimeRequiresProfile = errors.New("agent_profile_id is required to set initial_model or initial_config_options")
++
++// withInitialSessionRuntime converts the public task-create fields into the
++// existing first-session launch seed. Reserved metadata is always replaced by
++// server-owned values so callers cannot bind a seed to another profile.
++func withInitialSessionRuntime(metadata map[string]interface{}, agentProfileID, initialModel string, initialConfigOptions map[string]string) (map[string]interface{}, error) {
++	if metadata != nil {
++		delete(metadata, models.MetaKeyInitialSessionRuntimeConfig)
++		delete(metadata, models.MetaKeyInitialSessionRuntimeConfigProfileID)
++	}
++	seed := models.SessionRuntimeConfig{Model: strings.TrimSpace(initialModel)}
++	for key, value := range initialConfigOptions {
++		key = strings.TrimSpace(key)
++		value = strings.TrimSpace(value)
++		if key == "" || value == "" {
++			continue
++		}
++		if seed.ConfigOptions == nil {
++			seed.ConfigOptions = make(map[string]string, len(initialConfigOptions))
++		}
++		seed.ConfigOptions[key] = value
++	}
++	if seed.Model == "" && len(seed.ConfigOptions) == 0 {
++		return metadata, nil
++	}
++	if strings.TrimSpace(agentProfileID) == "" {
++		return nil, errInitialRuntimeRequiresProfile
++	}
++	if metadata == nil {
++		metadata = make(map[string]interface{})
++	}
++	metadata[models.MetaKeyInitialSessionRuntimeConfig] = seed
++	metadata[models.MetaKeyInitialSessionRuntimeConfigProfileID] = agentProfileID
++	return metadata, nil
++}
+diff --git a/apps/backend/internal/task/handlers/task_create_initial_model_test.go b/apps/backend/internal/task/handlers/task_create_initial_model_test.go
+new file mode 100644
+index 0000000..2bd549c
+--- /dev/null
++++ b/apps/backend/internal/task/handlers/task_create_initial_model_test.go
+@@ -0,0 +1,82 @@
++package handlers
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/kandev/kandev/internal/task/models"
++)
++
++func TestWithInitialSessionRuntimeSeedsSelectedProfile(t *testing.T) {
++	metadata, err := withInitialSessionRuntime(map[string]interface{}{"kept": true}, "profile-1", "  model-2  ", nil)
++	if err != nil {
++		t.Fatalf("withInitialSessionRuntime: %v", err)
++	}
++	config, ok := models.LoadInitialSessionRuntimeConfig(metadata)
++	if !ok || config.Model != "model-2" {
++		t.Fatalf("initial runtime config = %#v, %v; want model-2", config, ok)
++	}
++	if got := models.LoadInitialSessionRuntimeConfigProfileID(metadata); got != "profile-1" {
++		t.Fatalf("initial runtime config profile = %q; want profile-1", got)
++	}
++	if metadata["kept"] != true {
++		t.Fatal("unrelated metadata was removed")
++	}
++}
++
++func TestWithInitialSessionRuntimeSeedsConfigOptions(t *testing.T) {
++	metadata, err := withInitialSessionRuntime(nil, "profile-1", "", map[string]string{
++		"reasoning_effort": "high",
++		" empty ":          "   ",
++		"":                 "value",
++	})
++	if err != nil {
++		t.Fatalf("withInitialSessionRuntime: %v", err)
++	}
++	config, ok := models.LoadInitialSessionRuntimeConfig(metadata)
++	if !ok || config.Model != "" {
++		t.Fatalf("initial runtime config = %#v, %v; want empty model", config, ok)
++	}
++	if config.ConfigOptions["reasoning_effort"] != "high" || len(config.ConfigOptions) != 1 {
++		t.Fatalf("initial config options = %#v; want only reasoning_effort=high", config.ConfigOptions)
++	}
++}
++
++func TestWithInitialSessionRuntimeCombinesModelAndConfigOptions(t *testing.T) {
++	metadata, err := withInitialSessionRuntime(nil, "profile-1", "model-2", map[string]string{"reasoning_effort": "low"})
++	if err != nil {
++		t.Fatalf("withInitialSessionRuntime: %v", err)
++	}
++	config, ok := models.LoadInitialSessionRuntimeConfig(metadata)
++	if !ok || config.Model != "model-2" || config.ConfigOptions["reasoning_effort"] != "low" {
++		t.Fatalf("initial runtime config = %#v, %v; want model-2 with reasoning_effort=low", config, ok)
++	}
++}
++
++func TestWithInitialSessionRuntimeStripsClientOwnedSeed(t *testing.T) {
++	metadata := map[string]interface{}{
++		models.MetaKeyInitialSessionRuntimeConfig:          models.SessionRuntimeConfig{Model: "spoofed"},
++		models.MetaKeyInitialSessionRuntimeConfigProfileID: "other-profile",
++	}
++	metadata, err := withInitialSessionRuntime(metadata, "profile-1", "", nil)
++	if err != nil {
++		t.Fatalf("withInitialSessionRuntime: %v", err)
++	}
++	if _, ok := models.LoadInitialSessionRuntimeConfig(metadata); ok {
++		t.Fatal("client-owned initial runtime config was retained")
++	}
++	if got := models.LoadInitialSessionRuntimeConfigProfileID(metadata); got != "" {
++		t.Fatalf("client-owned initial runtime config profile = %q; want empty", got)
++	}
++}
++
++func TestWithInitialSessionRuntimeRequiresProfile(t *testing.T) {
++	_, err := withInitialSessionRuntime(nil, "", "model-2", nil)
++	if !errors.Is(err, errInitialRuntimeRequiresProfile) {
++		t.Fatalf("withInitialSessionRuntime error = %v; want %v", err, errInitialRuntimeRequiresProfile)
++	}
++	_, err = withInitialSessionRuntime(nil, "", "", map[string]string{"reasoning_effort": "high"})
++	if !errors.Is(err, errInitialRuntimeRequiresProfile) {
++		t.Fatalf("withInitialSessionRuntime error = %v; want %v", err, errInitialRuntimeRequiresProfile)
++	}
++}
+diff --git a/apps/backend/internal/task/handlers/task_http_handlers.go b/apps/backend/internal/task/handlers/task_http_handlers.go
+index 9672e15..6b51c5e 100644
+--- a/apps/backend/internal/task/handlers/task_http_handlers.go
++++ b/apps/backend/internal/task/handlers/task_http_handlers.go
+@@ -725,28 +725,30 @@ type httpTaskRepositoryInput struct {
+ }
+ 
+ type httpCreateTaskRequest struct {
+-	WorkspaceID       string                    `json:"workspace_id"`
+-	WorkflowID        string                    `json:"workflow_id"`
+-	WorkflowStepID    string                    `json:"workflow_step_id"`
+-	Title             string                    `json:"title"`
+-	Description       string                    `json:"description,omitempty"`
+-	AutoTitle         bool                      `json:"auto_title,omitempty"`
+-	Autopilot         bool                      `json:"autopilot,omitempty"`
+-	Priority          string                    `json:"priority,omitempty"`
+-	State             *v1.TaskState             `json:"state,omitempty"`
+-	Repositories      []httpTaskRepositoryInput `json:"repositories,omitempty"`
+-	Position          int                       `json:"position,omitempty"`
+-	Metadata          map[string]interface{}    `json:"metadata,omitempty"`
+-	StartAgent        bool                      `json:"start_agent,omitempty"`
+-	PrepareSession    bool                      `json:"prepare_session,omitempty"`
+-	AgentProfileID    string                    `json:"agent_profile_id,omitempty"`
+-	ExecutorID        string                    `json:"executor_id,omitempty"`
+-	ExecutorProfileID string                    `json:"executor_profile_id,omitempty"`
+-	PlanMode          bool                      `json:"plan_mode,omitempty"`
+-	Attachments       []v1.MessageAttachment    `json:"attachments,omitempty"`
+-	ParentID          string                    `json:"parent_id,omitempty"`
+-	WorkspacePath     string                    `json:"workspace_path,omitempty"`
+-	BlockedBy         []string                  `json:"blocked_by,omitempty"`
++	WorkspaceID          string                    `json:"workspace_id"`
++	WorkflowID           string                    `json:"workflow_id"`
++	WorkflowStepID       string                    `json:"workflow_step_id"`
++	Title                string                    `json:"title"`
++	Description          string                    `json:"description,omitempty"`
++	AutoTitle            bool                      `json:"auto_title,omitempty"`
++	Autopilot            bool                      `json:"autopilot,omitempty"`
++	Priority             string                    `json:"priority,omitempty"`
++	State                *v1.TaskState             `json:"state,omitempty"`
++	Repositories         []httpTaskRepositoryInput `json:"repositories,omitempty"`
++	Position             int                       `json:"position,omitempty"`
++	Metadata             map[string]interface{}    `json:"metadata,omitempty"`
++	StartAgent           bool                      `json:"start_agent,omitempty"`
++	PrepareSession       bool                      `json:"prepare_session,omitempty"`
++	AgentProfileID       string                    `json:"agent_profile_id,omitempty"`
++	InitialModel         string                    `json:"initial_model,omitempty"`
++	InitialConfigOptions map[string]string         `json:"initial_config_options,omitempty"`
++	ExecutorID           string                    `json:"executor_id,omitempty"`
++	ExecutorProfileID    string                    `json:"executor_profile_id,omitempty"`
++	PlanMode             bool                      `json:"plan_mode,omitempty"`
++	Attachments          []v1.MessageAttachment    `json:"attachments,omitempty"`
++	ParentID             string                    `json:"parent_id,omitempty"`
++	WorkspacePath        string                    `json:"workspace_path,omitempty"`
++	BlockedBy            []string                  `json:"blocked_by,omitempty"`
+ 	// StartWhenUnblocked records the agent start as an intent consumed by
+ 	// dependency resolution. nil derives it from StartAgent when BlockedBy is set.
+ 	StartWhenUnblocked *bool  `json:"start_when_unblocked,omitempty"`
+@@ -905,6 +907,11 @@ func (h *TaskHandlers) httpCreateTask(c *gin.Context) {
+ 			body.Metadata[models.MetaKeyExecutorProfileID] = body.ExecutorProfileID
+ 		}
+ 	}
++	body.Metadata, err = withInitialSessionRuntime(body.Metadata, body.AgentProfileID, body.InitialModel, body.InitialConfigOptions)
++	if err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++		return
++	}
+ 
+ 	title := strings.TrimSpace(body.Title)
+ 	description := strings.TrimSpace(body.Description)
+diff --git a/apps/backend/internal/task/handlers/task_ws_handlers.go b/apps/backend/internal/task/handlers/task_ws_handlers.go
+index 6d1caa3..70cdb8c 100644
+--- a/apps/backend/internal/task/handlers/task_ws_handlers.go
++++ b/apps/backend/internal/task/handlers/task_ws_handlers.go
+@@ -85,24 +85,26 @@ func (h *TaskHandlers) wsListTasks(ctx context.Context, msg *ws.Message) (*ws.Me
+ }
+ 
+ type wsCreateTaskRequest struct {
+-	WorkspaceID       string                    `json:"workspace_id"`
+-	WorkflowID        string                    `json:"workflow_id"`
+-	WorkflowStepID    string                    `json:"workflow_step_id"`
+-	Title             string                    `json:"title"`
+-	Description       string                    `json:"description,omitempty"`
+-	Autopilot         bool                      `json:"autopilot,omitempty"`
+-	Priority          string                    `json:"priority,omitempty"`
+-	State             *v1.TaskState             `json:"state,omitempty"`
+-	Repositories      []httpTaskRepositoryInput `json:"repositories,omitempty"`
+-	Position          int                       `json:"position,omitempty"`
+-	Metadata          map[string]interface{}    `json:"metadata,omitempty"`
+-	StartAgent        bool                      `json:"start_agent,omitempty"`
+-	AgentProfileID    string                    `json:"agent_profile_id,omitempty"`
+-	ExecutorID        string                    `json:"executor_id,omitempty"`
+-	ExecutorProfileID string                    `json:"executor_profile_id,omitempty"`
+-	PlanMode          bool                      `json:"plan_mode,omitempty"`
+-	Attachments       []v1.MessageAttachment    `json:"attachments,omitempty"`
+-	ParentID          string                    `json:"parent_id,omitempty"`
++	WorkspaceID          string                    `json:"workspace_id"`
++	WorkflowID           string                    `json:"workflow_id"`
++	WorkflowStepID       string                    `json:"workflow_step_id"`
++	Title                string                    `json:"title"`
++	Description          string                    `json:"description,omitempty"`
++	Autopilot            bool                      `json:"autopilot,omitempty"`
++	Priority             string                    `json:"priority,omitempty"`
++	State                *v1.TaskState             `json:"state,omitempty"`
++	Repositories         []httpTaskRepositoryInput `json:"repositories,omitempty"`
++	Position             int                       `json:"position,omitempty"`
++	Metadata             map[string]interface{}    `json:"metadata,omitempty"`
++	StartAgent           bool                      `json:"start_agent,omitempty"`
++	AgentProfileID       string                    `json:"agent_profile_id,omitempty"`
++	InitialModel         string                    `json:"initial_model,omitempty"`
++	InitialConfigOptions map[string]string         `json:"initial_config_options,omitempty"`
++	ExecutorID           string                    `json:"executor_id,omitempty"`
++	ExecutorProfileID    string                    `json:"executor_profile_id,omitempty"`
++	PlanMode             bool                      `json:"plan_mode,omitempty"`
++	Attachments          []v1.MessageAttachment    `json:"attachments,omitempty"`
++	ParentID             string                    `json:"parent_id,omitempty"`
+ }
+ 
+ func (h *TaskHandlers) wsCreateTask(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+@@ -162,6 +164,11 @@ func (h *TaskHandlers) wsCreateTask(ctx context.Context, msg *ws.Message) (*ws.M
+ 			req.Metadata[models.MetaKeyExecutorProfileID] = req.ExecutorProfileID
+ 		}
+ 	}
++	metadata, err := withInitialSessionRuntime(req.Metadata, req.AgentProfileID, req.InitialModel, req.InitialConfigOptions)
++	if err != nil {
++		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
++	}
++	req.Metadata = metadata
+ 
+ 	title := strings.TrimSpace(req.Title)
+ 	description := strings.TrimSpace(req.Description)

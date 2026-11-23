@@ -1,0 +1,427 @@
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+index a9320ef..3b2c0fd 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+@@ -27,8 +27,8 @@ type fakeInstructionLister struct {
+ 	files map[string][]*skill.InstructionFile
+ }
+ 
+-func (f *fakeInstructionLister) ListInstructions(_ context.Context, agentID string) ([]*skill.InstructionFile, error) {
+-	return f.files[agentID], nil
++func (f *fakeInstructionLister) ListInstructions(_ context.Context, agentTypeID, agentProfileID string) ([]*skill.InstructionFile, error) {
++	return f.files[agentTypeID+"/"+agentProfileID], nil
+ }
+ 
+ func newTestLogger(t *testing.T) *logger.Logger {
+@@ -67,7 +67,7 @@ func TestDeploy_Local_WritesSkillsAndInstructions(t *testing.T) {
+ 		"sk-foo": {Slug: "sk-foo", Content: "# foo skill", SourceType: "inline"},
+ 	}}
+ 	lister := &fakeInstructionLister{files: map[string][]*skill.InstructionFile{
+-		"profile-1": {{Filename: "AGENTS.md", Content: "# instructions", IsEntry: true}},
++		"claude-acp/profile-1": {{Filename: "AGENTS.md", Content: "# instructions", IsEntry: true}},
+ 	}}
+ 	d := newDeployer(t, base, reader, lister)
+ 
+@@ -162,7 +162,7 @@ func TestDeploy_Local_RewritesSiblingRefs(t *testing.T) {
+ 	base := t.TempDir()
+ 	worktree := t.TempDir()
+ 	lister := &fakeInstructionLister{files: map[string][]*skill.InstructionFile{
+-		"p1": {
++		"claude-acp/p1": {
+ 			{Filename: "AGENTS.md", Content: "Read `./HEARTBEAT.md` first.", IsEntry: true},
+ 			{Filename: "HEARTBEAT.md", Content: "Heartbeat checklist."},
+ 		},
+@@ -200,7 +200,7 @@ func TestDeploy_Local_RewritesSiblingRefs(t *testing.T) {
+ func TestDeploy_Sprites_RewritesSiblingRefsInManifest(t *testing.T) {
+ 	base := t.TempDir()
+ 	lister := &fakeInstructionLister{files: map[string][]*skill.InstructionFile{
+-		"p1": {
++		"claude-acp/p1": {
+ 			{Filename: "AGENTS.md", Content: "See ./HEARTBEAT.md."},
+ 			{Filename: "HEARTBEAT.md", Content: "checklist"},
+ 		},
+@@ -280,7 +280,7 @@ func TestDeploy_Sprites_SetsManifestJSONMetadata(t *testing.T) {
+ 		"sk-foo": {Slug: "sk-foo", Content: "# foo", SourceType: "inline"},
+ 	}}
+ 	lister := &fakeInstructionLister{files: map[string][]*skill.InstructionFile{
+-		"p1": {{Filename: "AGENTS.md", Content: "# inst"}},
++		"claude-acp/p1": {{Filename: "AGENTS.md", Content: "# inst"}},
+ 	}}
+ 	d := newDeployer(t, base, reader, lister)
+ 
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/manifest.go b/apps/backend/internal/agent/runtime/lifecycle/skill/manifest.go
+index 71cc371..539a0e2 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/manifest.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/manifest.go
+@@ -30,7 +30,7 @@ func (d *Deployer) buildManifest(ctx context.Context, profile *settingsmodels.Ag
+ 		ProjectSkillDir: d.resolveProjectSkillDir(agentTypeID),
+ 	}
+ 	d.appendSkills(ctx, manifest, profile)
+-	d.appendInstructions(ctx, manifest, profile.ID)
++	d.appendInstructions(ctx, manifest, agentTypeID, profile.ID)
+ 	return manifest
+ }
+ 
+@@ -52,15 +52,12 @@ func (d *Deployer) appendSkills(ctx context.Context, manifest *Manifest, profile
+ 	}
+ }
+ 
+-// appendInstructions appends every instruction file persisted for the
+-// agent profile. A nil InstructionLister or repo error leaves the
+-// manifest's Instructions slice empty — the prompt builder treats an
+-// empty AGENTS.md as "no preamble".
+-func (d *Deployer) appendInstructions(ctx context.Context, manifest *Manifest, agentProfileID string) {
++// appendInstructions appends the effective instruction files for the agent profile. A nil InstructionLister or repo error leaves the manifest's Instructions slice empty — the prompt builder treats an empty AGENTS.md as "no preamble".
++func (d *Deployer) appendInstructions(ctx context.Context, manifest *Manifest, agentTypeID, agentProfileID string) {
+ 	if d.instructionLister == nil {
+ 		return
+ 	}
+-	files, err := d.instructionLister.ListInstructions(ctx, agentProfileID)
++	files, err := d.instructionLister.ListInstructions(ctx, agentTypeID, agentProfileID)
+ 	if err != nil {
+ 		d.logger.Warn("failed to load instructions for manifest",
+ 			zap.String("agent_id", agentProfileID), zap.Error(err))
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/types.go b/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
+index 109739a..9f44cb5 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/types.go
+@@ -53,11 +53,9 @@ type SkillReader interface {
+ 	GetSkillFromConfig(ctx context.Context, idOrSlug string) (*Skill, error)
+ }
+ 
+-// InstructionLister returns the instruction files associated with a
+-// given agent_profile_id. Implemented by the office repository and
+-// passed in via the deployer constructor.
++// InstructionLister returns agent-family defaults merged with profile-specific instruction overrides.
+ type InstructionLister interface {
+-	ListInstructions(ctx context.Context, agentProfileID string) ([]*InstructionFile, error)
++	ListInstructions(ctx context.Context, agentTypeID, agentProfileID string) ([]*InstructionFile, error)
+ }
+ 
+ // ProjectSkillDirResolver maps an agent type ID to the CWD-relative
+diff --git a/apps/backend/internal/backendapp/main.go b/apps/backend/internal/backendapp/main.go
+index e01b401..805dd43 100644
+--- a/apps/backend/internal/backendapp/main.go
++++ b/apps/backend/internal/backendapp/main.go
+@@ -1213,6 +1213,8 @@ func initOfficeServices(
+ 		cfg, repos, services, orchestratorSvc, eventBus,
+ 		agentctlBinaryPath, cfgLoader, cfgWriter, log,
+ 	)
++	// The runtime deployer serves Kanban and Office launches, so wire it before the Office feature gate.
++	wireRuntimeSkillDeployer(lifecycleMgr, agentRegistry, repos.Office, runProcessorSvc, cfg.ResolvedHomeDir(), log)
+ 
+ 	// Task dependencies are a core Kanban relationship, not an Office feature.
+ 	// The task_blockers table physically lives in the Office repository's DDL but
+@@ -1257,12 +1259,6 @@ func initOfficeServices(
+ 	services.Office.SetPricingLookup(pricingLookup)
+ 	orchestratorSvc.SetModelInfoLookup(pricingLookup)
+ 
+-	// ADR 0005 Wave E: plug the runtime-tier skill deployer into the
+-	// lifecycle manager. The deployer reads office's skills repo +
+-	// instructions repo via small adapters; office no longer ships
+-	// its own delivery code.
+-	wireRuntimeSkillDeployer(lifecycleMgr, agentRegistry, repos.Office, services.Office, cfg.ResolvedHomeDir(), log)
+-
+ 	// Wire office-owned repositories into the task service for cross-package
+ 	// operations. The blocker repository is wired above, before the Office gate,
+ 	// because task dependencies are not Office-only.
+diff --git a/apps/backend/internal/backendapp/managed_config.go b/apps/backend/internal/backendapp/managed_config.go
+index 63856f1..ce43bb0 100644
+--- a/apps/backend/internal/backendapp/managed_config.go
++++ b/apps/backend/internal/backendapp/managed_config.go
+@@ -73,19 +73,24 @@ func applyManagedConfiguration(
+ }
+ 
+ type managedInstructionStore interface {
+-	UpsertInstruction(ctx context.Context, agentProfileID, filename, content string, isEntry bool) error
++	UpsertInstruction(ctx context.Context, ownerID, filename, content string, isEntry bool) error
++	DeleteInstruction(ctx context.Context, ownerID, filename string) error
+ }
+ 
+-func reconcileManagedProfileInstructions(
++func reconcileManagedInstructions(
+ 	ctx context.Context,
+ 	store managedInstructionStore,
+-	agentProfileID string,
++	ownerID string,
+ 	instructions *string,
++	deleteAbsent bool,
+ ) error {
+ 	if instructions == nil {
++		if deleteAbsent {
++			return store.DeleteInstruction(ctx, ownerID, "AGENTS.md")
++		}
+ 		return nil
+ 	}
+-	return store.UpsertInstruction(ctx, agentProfileID, "AGENTS.md", *instructions, true)
++	return store.UpsertInstruction(ctx, ownerID, "AGENTS.md", *instructions, true)
+ }
+ 
+ func applyManagedPlugins(ctx context.Context, services *Services, desired []config.ManagedPlugin) error {
+@@ -192,6 +197,9 @@ func applyManagedAgents(
+ 			}
+ 			agent = created
+ 		}
++		if err := reconcileManagedInstructions(ctx, instructions, agent.ID, configuredAgent.Instructions, false); err != nil {
++			return fmt.Errorf("reconcile instructions for agent %q: %w", configuredAgent.Name, err)
++		}
+ 		for _, configuredProfile := range configuredAgent.Profiles {
+ 			environment, err := managedAgentEnvironment(configuredProfile.Environment, refs.secrets)
+ 			if err != nil {
+@@ -234,7 +242,7 @@ func applyManagedAgents(
+ 				}
+ 				current = updated
+ 			}
+-			if err := reconcileManagedProfileInstructions(ctx, instructions, current.ID, configuredProfile.Instructions); err != nil {
++			if err := reconcileManagedInstructions(ctx, instructions, current.ID, configuredProfile.Instructions, configuredAgent.Instructions != nil); err != nil {
+ 				return fmt.Errorf("reconcile instructions for agent profile %q/%q: %w", configuredAgent.Name, configuredProfile.Name, err)
+ 			}
+ 			refs.agentProfiles[configuredAgent.Name+"/"+configuredProfile.Name] = current.ID
+diff --git a/apps/backend/internal/backendapp/managed_config_test.go b/apps/backend/internal/backendapp/managed_config_test.go
+index 75b083a..f8c17c4 100644
+--- a/apps/backend/internal/backendapp/managed_config_test.go
++++ b/apps/backend/internal/backendapp/managed_config_test.go
+@@ -24,7 +24,13 @@ func (s *recordingManagedInstructionStore) UpsertInstruction(
+ 	return nil
+ }
+ 
++func (s *recordingManagedInstructionStore) DeleteInstruction(_ context.Context, ownerID, filename string) error {
++	delete(s.files[ownerID], filename)
++	s.calls++
++	return nil
++}
++
+-func TestReconcileManagedProfileInstructions(t *testing.T) {
++func TestReconcileManagedInstructions(t *testing.T) {
+ 	ctx := context.Background()
+ 	store := &recordingManagedInstructionStore{files: map[string]map[string]string{
+ 		"codex":    {"AGENTS.md": "old", "HEARTBEAT.md": "keep"},
+@@ -32,16 +38,16 @@ func TestReconcileManagedProfileInstructions(t *testing.T) {
+ 	}}
+ 
+ 	managed := "new"
+-	if err := reconcileManagedProfileInstructions(ctx, store, "new-profile", &managed); err != nil {
++	if err := reconcileManagedInstructions(ctx, store, "new-profile", &managed, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if got := store.files["new-profile"]["AGENTS.md"]; got != "new" {
+ 		t.Fatalf("new managed AGENTS.md = %q", got)
+ 	}
+-	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &managed); err != nil {
++	if err := reconcileManagedInstructions(ctx, store, "codex", &managed, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &managed); err != nil {
++	if err := reconcileManagedInstructions(ctx, store, "codex", &managed, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if got := store.files["codex"]["AGENTS.md"]; got != "new" {
+@@ -55,15 +61,24 @@ func TestReconcileManagedProfileInstructions(t *testing.T) {
+ 	}
+ 
+ 	empty := ""
+-	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &empty); err != nil {
++	if err := reconcileManagedInstructions(ctx, store, "codex", &empty, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if got := store.files["codex"]["AGENTS.md"]; got != "" {
+ 		t.Fatalf("explicit empty AGENTS.md = %q", got)
+ 	}
++	if err := reconcileManagedInstructions(ctx, store, "codex", nil, true); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := store.files["codex"]["AGENTS.md"]; ok {
++		t.Fatal("inherited AGENTS.md retained a profile override")
++	}
++	if got := store.files["codex"]["HEARTBEAT.md"]; got != "keep" {
++		t.Fatalf("unmanaged sibling = %q", got)
++	}
+ 
+ 	calls := store.calls
+-	if err := reconcileManagedProfileInstructions(ctx, store, "codex", nil); err != nil {
++	if err := reconcileManagedInstructions(ctx, store, "codex", nil, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if store.calls != calls {
+diff --git a/apps/backend/internal/common/config/managed.go b/apps/backend/internal/common/config/managed.go
+index 50fe477..cc42945 100644
+--- a/apps/backend/internal/common/config/managed.go
++++ b/apps/backend/internal/common/config/managed.go
+@@ -20,8 +20,9 @@ type ManagedSecret struct {
+ }
+ 
+ type ManagedAgent struct {
+-	Name     string                `mapstructure:"name"`
+-	Profiles []ManagedAgentProfile `mapstructure:"profiles"`
++	Name         string                `mapstructure:"name"`
++	Instructions *string               `mapstructure:"instructions"`
++	Profiles     []ManagedAgentProfile `mapstructure:"profiles"`
+ }
+ 
+ type ManagedAgentProfile struct {
+diff --git a/apps/backend/internal/common/config/managed_test.go b/apps/backend/internal/common/config/managed_test.go
+index 7e3ef74..835ce3a 100644
+--- a/apps/backend/internal/common/config/managed_test.go
++++ b/apps/backend/internal/common/config/managed_test.go
+@@ -11,7 +11,7 @@ func TestManagedConfigFromFile(t *testing.T) {
+ 	contents := `{
+ 		"managed": {
+ 			"plugins": [{"id": "resource-coordinator", "version": "0.2.0", "packageFile": "/package.tar.gz"}],
+-			"agents": [{"name": "codex-acp", "profiles": [
++			"agents": [{"name": "codex-acp", "instructions": "family", "profiles": [
+ 				{"name": "managed", "instructions": ""},
+ 				{"name": "unmanaged"}
+ 			]}],
+@@ -41,6 +41,9 @@ func TestManagedConfigFromFile(t *testing.T) {
+ 		t.Fatalf("managed plugins = %#v", cfg.Managed.Plugins)
+ 	}
+ 	profiles := cfg.Managed.Agents[0].Profiles
++	if instructions := cfg.Managed.Agents[0].Instructions; instructions == nil || *instructions != "family" {
++		t.Fatalf("agent instructions = %#v", instructions)
++	}
+ 	if profiles[0].Instructions == nil || *profiles[0].Instructions != "" {
+ 		t.Fatalf("explicit empty instructions = %#v", profiles[0].Instructions)
+ 	}
+diff --git a/apps/backend/internal/office/skills/runtime_adapter.go b/apps/backend/internal/office/skills/runtime_adapter.go
+index 5ed5059..39a77fb 100644
+--- a/apps/backend/internal/office/skills/runtime_adapter.go
++++ b/apps/backend/internal/office/skills/runtime_adapter.go
+@@ -8,6 +8,7 @@ package skills
+ import (
+ 	"context"
+ 	"encoding/json"
++	"sort"
+ 
+ 	runtimeskill "github.com/kandev/kandev/internal/agent/runtime/lifecycle/skill"
+ 	"github.com/kandev/kandev/internal/office/models"
+@@ -95,24 +96,50 @@ func NewInstructionListerAdapter(inner officeInstructionLister) *InstructionList
+ 
+ // ListInstructions satisfies runtimeskill.InstructionLister. Returns
+ // nil when the office lister is unset.
+-func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentProfileID string) ([]*runtimeskill.InstructionFile, error) {
++func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentTypeID, agentProfileID string) ([]*runtimeskill.InstructionFile, error) {
+ 	if a == nil || a.inner == nil {
+ 		return nil, nil
+ 	}
+-	files, err := a.inner.ListInstructions(ctx, agentProfileID)
+-	if err != nil {
+-		return nil, err
++	var familyFiles []*models.InstructionFile
++	if agentTypeID != "" {
++		files, err := a.inner.ListInstructions(ctx, agentTypeID)
++		if err != nil {
++			return nil, err
++		}
++		familyFiles = files
+ 	}
+-	out := make([]*runtimeskill.InstructionFile, 0, len(files))
+-	for _, f := range files {
+-		if f == nil {
+-			continue
++	var profileFiles []*models.InstructionFile
++	if agentProfileID != "" && agentProfileID != agentTypeID {
++		files, err := a.inner.ListInstructions(ctx, agentProfileID)
++		if err != nil {
++			return nil, err
+ 		}
+-		out = append(out, &runtimeskill.InstructionFile{
+-			Filename: f.Filename,
+-			Content:  f.Content,
+-			IsEntry:  f.IsEntry,
+-		})
++		profileFiles = files
+ 	}
++	merged := make(map[string]*runtimeskill.InstructionFile, len(familyFiles)+len(profileFiles))
++	merge := func(files []*models.InstructionFile) {
++		for _, f := range files {
++			if f == nil {
++				continue
++			}
++			merged[f.Filename] = &runtimeskill.InstructionFile{
++				Filename: f.Filename,
++				Content:  f.Content,
++				IsEntry:  f.IsEntry,
++			}
++		}
++	}
++	merge(familyFiles)
++	merge(profileFiles)
++	out := make([]*runtimeskill.InstructionFile, 0, len(merged))
++	for _, file := range merged {
++		out = append(out, file)
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].IsEntry != out[j].IsEntry {
++			return out[i].IsEntry
++		}
++		return out[i].Filename < out[j].Filename
++	})
+ 	return out, nil
+ }
+diff --git a/apps/backend/internal/office/skills/runtime_adapter_test.go b/apps/backend/internal/office/skills/runtime_adapter_test.go
+index 49ff223..d206167 100644
+--- a/apps/backend/internal/office/skills/runtime_adapter_test.go
++++ b/apps/backend/internal/office/skills/runtime_adapter_test.go
+@@ -15,6 +15,14 @@ func (s stubOfficeSkillReader) GetSkillFromConfig(context.Context, string) (*mod
+ 	return s.skill, nil
+ }
+ 
++type stubOfficeInstructionLister struct {
++	files map[string][]*models.InstructionFile
++}
++
++func (s stubOfficeInstructionLister) ListInstructions(_ context.Context, ownerID string) ([]*models.InstructionFile, error) {
++	return s.files[ownerID], nil
++}
++
+ func TestSkillReaderAdapterMapsInventoryFiles(t *testing.T) {
+ 	adapter := NewSkillReaderAdapter(stubOfficeSkillReader{skill: &models.Skill{
+ 		Slug:          "office-admin",
+@@ -36,3 +44,47 @@ func TestSkillReaderAdapterMapsInventoryFiles(t *testing.T) {
+ 		t.Errorf("file = %+v", got.Files[0])
+ 	}
+ }
++
++func TestInstructionListerAdapterMergesFamilyDefaultsWithProfileOverrides(t *testing.T) {
++	adapter := NewInstructionListerAdapter(stubOfficeInstructionLister{files: map[string][]*models.InstructionFile{
++		"codex-acp": {
++			{Filename: "AGENTS.md", Content: "family", IsEntry: true},
++			{Filename: "FAMILY.md", Content: "shared"},
++		},
++		"profile-1": {
++			{Filename: "AGENTS.md", Content: "profile", IsEntry: true},
++			{Filename: "PROFILE.md", Content: "specific"},
++		},
++	}})
++
++	got, err := adapter.ListInstructions(context.Background(), "codex-acp", "profile-1")
++	if err != nil {
++		t.Fatalf("ListInstructions: %v", err)
++	}
++	if len(got) != 3 {
++		t.Fatalf("instructions = %+v, want three files", got)
++	}
++	if got[0].Filename != "AGENTS.md" || got[0].Content != "profile" || !got[0].IsEntry {
++		t.Fatalf("entry instruction = %+v", got[0])
++	}
++	if got[1].Filename != "FAMILY.md" || got[1].Content != "shared" {
++		t.Fatalf("family instruction = %+v", got[1])
++	}
++	if got[2].Filename != "PROFILE.md" || got[2].Content != "specific" {
++		t.Fatalf("profile instruction = %+v", got[2])
++	}
++}
++
++func TestInstructionListerAdapterGivesFamilyInstructionsToNewProfile(t *testing.T) {
++	adapter := NewInstructionListerAdapter(stubOfficeInstructionLister{files: map[string][]*models.InstructionFile{
++		"opencode-acp": {{Filename: "AGENTS.md", Content: "family", IsEntry: true}},
++	}})
++
++	got, err := adapter.ListInstructions(context.Background(), "opencode-acp", "new-profile")
++	if err != nil {
++		t.Fatalf("ListInstructions: %v", err)
++	}
++	if len(got) != 1 || got[0].Filename != "AGENTS.md" || got[0].Content != "family" {
++		t.Fatalf("instructions = %+v, want inherited AGENTS.md", got)
++	}
++}

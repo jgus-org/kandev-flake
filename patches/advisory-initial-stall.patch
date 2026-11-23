@@ -1,0 +1,167 @@
+diff --git a/apps/backend/internal/orchestrator/event_handlers_stall.go b/apps/backend/internal/orchestrator/event_handlers_stall.go
+index 975b75f..bd43c52 100644
+--- a/apps/backend/internal/orchestrator/event_handlers_stall.go
++++ b/apps/backend/internal/orchestrator/event_handlers_stall.go
+@@ -2,7 +2,6 @@ package orchestrator
+ 
+ import (
+ 	"context"
+-	"errors"
+ 	"fmt"
+ 	"strings"
+ 
+@@ -17,23 +16,8 @@ const (
+ 	stallCancelTurnButtonTestID = "stall-cancel-turn-button"
+ 	metaKeyActionVisibility     = "action_visibility"
+ 	actionVisibilityRunning     = "running"
+-	neverStartedNoticeContent   = "Agent produced no output since start."
+ )
+ 
+-// errAgentNeverStarted is the launch-failure error recorded when a stalled
+-// prompt's agent has emitted zero events since dispatch. Its Error() string
+-// is persisted as the session's error_message by recordSessionLaunchFailure;
+-// it is not a missing-branch error, so no legacy branch guidance is created.
+-var errAgentNeverStarted = errors.New("agent produced no output since start")
+-
+-// handleAgentStalled persists an advisory recovery affordance for a turn that
+-// stalled after producing at least one agent event, leaving the prompt,
+-// session, and task lifecycle unchanged. When the agent has produced no
+-// output at all since the prompt was dispatched (payload.NeverStarted), the
+-// condition is terminal and unrecoverable: the notice is posted as an error
+-// and the session/task transition to FAILED via the same idempotent CAS path
+-// used for launch failures. The activity epoch prevents a late event from
+-// turning an old watchdog snapshot into a terminal failure.
+ func (s *Service) handleAgentStalled(ctx context.Context, payload lifecycle.AgentStalledPayload) {
+ 	if s.messageCreator == nil || s.repo == nil || payload.TaskID == "" || payload.SessionID == "" {
+ 		return
+@@ -86,27 +70,22 @@ func (s *Service) handleAgentStalled(ctx context.Context, payload lifecycle.Agen
+ 		metaKeySessionID: payload.SessionID,
+ 		metaKeyTaskID:    payload.TaskID,
+ 	}
+-	messageType := string(v1.MessageTypeStatus)
+-	if payload.NeverStarted {
+-		messageType = string(v1.MessageTypeError)
+-	} else {
+-		metadata[metaKeyActionVisibility] = actionVisibilityRunning
+-		metadata["actions"] = []map[string]interface{}{{
+-			actionMetaKeyType:   "ws_request",
+-			actionMetaKeyLabel:  "Cancel turn",
+-			actionMetaKeyTestID: stallCancelTurnButtonTestID,
+-			"params": map[string]interface{}{
+-				"method":  "agent.cancel",
+-				"payload": map[string]interface{}{"session_id": payload.SessionID},
+-			},
+-		}}
+-	}
++	metadata[metaKeyActionVisibility] = actionVisibilityRunning
++	metadata["actions"] = []map[string]interface{}{{
++		actionMetaKeyType:   "ws_request",
++		actionMetaKeyLabel:  "Cancel turn",
++		actionMetaKeyTestID: stallCancelTurnButtonTestID,
++		"params": map[string]interface{}{
++			"method":  "agent.cancel",
++			"payload": map[string]interface{}{"session_id": payload.SessionID},
++		},
++	}}
+ 	if err := s.messageCreator.CreateSessionMessage(
+ 		ctx,
+ 		payload.TaskID,
+ 		stallNoticeContent(payload),
+ 		payload.SessionID,
+-		messageType,
++		string(v1.MessageTypeStatus),
+ 		turnID,
+ 		metadata,
+ 		false,
+@@ -116,15 +95,9 @@ func (s *Service) handleAgentStalled(ctx context.Context, payload lifecycle.Agen
+ 			zap.String("session_id", payload.SessionID),
+ 			zap.Error(err))
+ 	}
+-	if payload.NeverStarted {
+-		s.recordSessionLaunchFailure(ctx, payload.TaskID, payload.SessionID, errAgentNeverStarted, session)
+-	}
+ }
+ 
+ func stallNoticeContent(payload lifecycle.AgentStalledPayload) string {
+-	if payload.NeverStarted {
+-		return neverStartedNoticeContent
+-	}
+ 	tool := strings.TrimSpace(payload.ToolTitle)
+ 	if tool == "" {
+ 		tool = strings.TrimSpace(payload.ToolName)
+diff --git a/apps/backend/internal/orchestrator/event_handlers_stall_test.go b/apps/backend/internal/orchestrator/event_handlers_stall_test.go
+index d62df39..f51251e 100644
+--- a/apps/backend/internal/orchestrator/event_handlers_stall_test.go
++++ b/apps/backend/internal/orchestrator/event_handlers_stall_test.go
+@@ -90,7 +90,7 @@ func TestHandleAgentStalled_PersistsNeutralRunningNotice(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHandleAgentStalled_NeverStartedFailsSessionAndTask(t *testing.T) {
++func TestHandleAgentStalled_NeverStartedRemainsAdvisory(t *testing.T) {
+ 	ctx := context.Background()
+ 	repo := setupTestRepo(t)
+ 	seedSession(t, repo, "task-1", "session-1", "step-1")
+@@ -129,35 +129,36 @@ func TestHandleAgentStalled_NeverStartedFailsSessionAndTask(t *testing.T) {
+ 		t.Fatalf("session messages = %d, want 1", len(messages.sessionMessages))
+ 	}
+ 	message := messages.sessionMessages[0]
+-	if message.messageType != string(v1.MessageTypeError) {
+-		t.Fatalf("message type = %q, want error", message.messageType)
++	if message.messageType != string(v1.MessageTypeStatus) {
++		t.Fatalf("message type = %q, want status", message.messageType)
+ 	}
+-	if message.content != neverStartedNoticeContent {
+-		t.Fatalf("notice content = %q, want the never-started condition named", message.content)
++	if message.content != "Still waiting for the agent." {
++		t.Fatalf("notice content = %q, want generic waiting status", message.content)
+ 	}
+ 	if message.turnID != activeTurn.ID {
+ 		t.Fatalf("notice turn ID = %q, want active turn %q", message.turnID, activeTurn.ID)
+ 	}
+-	if _, hasVisibility := message.metadata["action_visibility"]; hasVisibility {
+-		t.Fatalf("terminal notice has running visibility metadata: %#v", message.metadata)
++	if message.metadata["action_visibility"] != actionVisibilityRunning {
++		t.Fatalf("action visibility = %v, want running", message.metadata["action_visibility"])
+ 	}
+-	if _, hasActions := message.metadata["actions"]; hasActions {
+-		t.Fatalf("terminal notice has a running cancel action: %#v", message.metadata)
++	actions, ok := message.metadata["actions"].([]map[string]interface{})
++	if !ok || len(actions) != 1 {
++		t.Fatalf("actions = %#v, want one cancel action", message.metadata["actions"])
+ 	}
+ 
+ 	after, err := repo.GetTaskSession(ctx, "session-1")
+ 	if err != nil {
+ 		t.Fatalf("get session after handling stall: %v", err)
+ 	}
+-	if after.State != models.TaskSessionStateFailed {
+-		t.Fatalf("session state = %q, want FAILED", after.State)
++	if after.State != models.TaskSessionStateRunning {
++		t.Fatalf("session state = %q, want RUNNING", after.State)
+ 	}
+ 
+ 	taskRepo.mu.Lock()
+-	taskState := taskRepo.updatedStates["task-1"]
++	_, taskUpdated := taskRepo.updatedStates["task-1"]
+ 	taskRepo.mu.Unlock()
+-	if taskState != v1.TaskStateFailed {
+-		t.Fatalf("task state = %q, want FAILED", taskState)
++	if taskUpdated {
++		t.Fatal("task state changed")
+ 	}
+ }
+ 
+@@ -225,9 +226,9 @@ func TestStallNoticeContentFallsBackWithoutTool(t *testing.T) {
+ 	}
+ }
+ 
+-func TestStallNoticeContentNamesNeverStartedCondition(t *testing.T) {
++func TestStallNoticeContentUsesToolForNeverStartedPrompt(t *testing.T) {
+ 	payload := lifecycle.AgentStalledPayload{NeverStarted: true, ToolName: "shell", ToolTitle: "Start dev server"}
+-	if got := stallNoticeContent(payload); got != neverStartedNoticeContent {
+-		t.Fatalf("stallNoticeContent() = %q, want the never-started message regardless of tool info", got)
++	if got := stallNoticeContent(payload); got != "Still waiting on Start dev server." {
++		t.Fatalf("stallNoticeContent() = %q, want tool status", got)
+ 	}
+ }

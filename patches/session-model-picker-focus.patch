@@ -1,0 +1,102 @@
+diff --git a/web/components/task/chat/route-panel-mouse-down.ts b/web/components/task/chat/route-panel-mouse-down.ts
+--- a/web/components/task/chat/route-panel-mouse-down.ts
++++ b/web/components/task/chat/route-panel-mouse-down.ts
+@@ -8,6 +8,7 @@
+   ref: RefObject<HTMLDivElement | null>,
+ ): void {
+   const target = event.target as HTMLElement | null;
+-  if (!target || target.closest(interactiveSelector)) return;
++  // Portal events bubble through React; focusing the panel would dismiss their popup before click.
++  if (!target || !event.currentTarget.contains(target) || target.closest(interactiveSelector)) return;
+   ref.current?.focus({ preventScroll: true });
+ }
+diff --git a/web/components/task/chat/route-panel-mouse-down.test.tsx b/web/components/task/chat/route-panel-mouse-down.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/components/task/chat/route-panel-mouse-down.test.tsx
+@@ -0,0 +1,85 @@
++import { createRef, type ReactNode } from "react";
++import { createPortal } from "react-dom";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { ModelConfigSelector } from "@/components/model-config-selector";
++import { routePanelMouseDown } from "./route-panel-mouse-down";
++
++afterEach(cleanup);
++
++function renderPanel(children?: ReactNode) {
++  const panelRef = createRef<HTMLDivElement>();
++  render(
++    <div
++      ref={panelRef}
++      tabIndex={-1}
++      data-testid="panel"
++      onMouseDown={(event) => routePanelMouseDown(event, panelRef)}
++    >
++      <p>Chat message</p>
++      <input aria-label="Message" />
++      {children}
++    </div>,
++  );
++  return screen.getByTestId("panel");
++}
++
++describe("chat panel mouse focus", () => {
++  it("focuses the panel when its message background is pressed", () => {
++    const panel = renderPanel();
++    fireEvent.mouseDown(screen.getByText("Chat message"));
++    expect(document.activeElement).toBe(panel);
++  });
++
++  it("leaves native input focus alone", () => {
++    renderPanel();
++    const input = screen.getByRole("textbox", { name: "Message" });
++    input.focus();
++    fireEvent.mouseDown(input);
++    expect(document.activeElement).toBe(input);
++  });
++
++  it("leaves focus inside a portaled surface when its background is pressed", () => {
++    renderPanel(
++      createPortal(
++        <div tabIndex={-1} data-testid="portal">
++          <p>Popup content</p>
++        </div>,
++        document.body,
++      ),
++    );
++    const popup = screen.getByTestId("portal");
++    popup.focus();
++    fireEvent.mouseDown(screen.getByText("Popup content"));
++    expect(document.activeElement).toBe(popup);
++  });
++
++  it("lets a mouse press reach a portaled model option without dismissing it", () => {
++    const onModelChange = vi.fn();
++    renderPanel(
++      <ModelConfigSelector
++        modelOptions={[
++          { id: "fast", name: "Fast" },
++          { id: "smart", name: "Smart" },
++        ]}
++        currentModel="fast"
++        onModelChange={onModelChange}
++        configOptions={[
++          {
++            type: "select",
++            id: "effort",
++            name: "Effort",
++            currentValue: "high",
++            options: [{ value: "high", name: "High" }],
++          },
++        ]}
++      />,
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Model settings" }));
++    // A browser dispatches mousedown before click; click alone misses focus dismissal.
++    fireEvent.mouseDown(screen.getByText("Smart"));
++    fireEvent.click(screen.getByRole("option", { name: /Smart/ }));
++    expect(onModelChange).toHaveBeenCalledExactlyOnceWith("smart");
++    expect(screen.getByTestId("config-option-trigger-effort")).toBeTruthy();
++  });
++});

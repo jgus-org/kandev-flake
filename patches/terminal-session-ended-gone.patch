@@ -1,0 +1,136 @@
+diff --git a/apps/backend/internal/gateway/websocket/terminal_handler.go b/apps/backend/internal/gateway/websocket/terminal_handler.go
+index 262950d..af4c22c 100644
+--- a/apps/backend/internal/gateway/websocket/terminal_handler.go
++++ b/apps/backend/internal/gateway/websocket/terminal_handler.go
+@@ -135,14 +135,23 @@ func (h *TerminalHandler) handleAgentTerminalRoute(c *gin.Context, sessionID str
+ 	h.handleAgentPassthroughWS(c, sessionID, interactiveRunner)
+ }
+ 
++// terminalReasonSessionEnded is the HTTP-body marker the browser terminal client
++// recognizes to stop reconnecting. It mirrors the "session_terminal" reason the
++// git handlers return over WebSocket, so an ended terminal has one vocabulary.
++const terminalReasonSessionEnded = "session_terminal"
++
+ func (h *TerminalHandler) handleEnvironmentUserShellWS(c *gin.Context, environmentID, terminalID string) {
+ 	execution, err := h.lifecycleMgr.GetOrEnsureExecutionForEnvironment(c.Request.Context(), environmentID)
+ 	if err != nil {
+-		h.logger.Warn("environment terminal execution not ready",
+-			zap.String("task_environment_id", environmentID),
+-			zap.String("terminal_id", terminalID),
+-			zap.Error(err))
+-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
++		h.respondShellTerminalReadiness(c, err, environmentID, terminalID)
++		return
++	}
++	// A GET without an Upgrade header is a reconnect-probe. A browser cannot read
++	// the HTTP status of a failed WebSocket handshake, so the client re-checks via
++	// plain HTTP to tell a permanently-ended terminal (handled above) from a
++	// transient one. Report readiness as JSON and let it decide whether to open.
++	if !gorillaws.IsWebSocketUpgrade(c.Request) {
++		c.JSON(http.StatusOK, gin.H{"ready": true})
+ 		return
+ 	}
+ 	if h.shouldUseWorkspaceShell(c.Request.Context(), execution.SessionID) {
+@@ -172,6 +181,28 @@ func (h *TerminalHandler) handleEnvironmentUserShellWS(c *gin.Context, environme
+ 	h.handleUserShellWS(c, execution, environmentID, terminalID, interactiveRunner)
+ }
+ 
++// respondShellTerminalReadiness maps a shell-terminal execution-readiness error to
++// the HTTP status returned before any WebSocket upgrade. A terminal session will
++// never gain an execution, so it is Gone: a permanent answer the client must stop
++// retrying on (503 would tell it to "retry later", which it does forever). Every
++// other failure — the workspace is still being prepared, a transient startup race —
++// stays Service Unavailable so normal terminal startup is unaffected.
++func (h *TerminalHandler) respondShellTerminalReadiness(c *gin.Context, err error, environmentID, terminalID string) {
++	if errors.Is(err, lifecycle.ErrSessionTerminal) {
++		h.logger.Info("environment terminal session is terminal",
++			zap.String("task_environment_id", environmentID),
++			zap.String("terminal_id", terminalID),
++			zap.Error(err))
++		c.JSON(http.StatusGone, gin.H{"error": err.Error(), "reason": terminalReasonSessionEnded})
++		return
++	}
++	h.logger.Warn("environment terminal execution not ready",
++		zap.String("task_environment_id", environmentID),
++		zap.String("terminal_id", terminalID),
++		zap.Error(err))
++	c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
++}
++
+ func (h *TerminalHandler) handleRemoteUserShellWS(
+ 	c *gin.Context,
+ 	execution *lifecycle.AgentExecution,
+diff --git a/apps/backend/internal/gateway/websocket/terminal_handler_routes_test.go b/apps/backend/internal/gateway/websocket/terminal_handler_routes_test.go
+index 7b078f0..6bf5024 100644
+--- a/apps/backend/internal/gateway/websocket/terminal_handler_routes_test.go
++++ b/apps/backend/internal/gateway/websocket/terminal_handler_routes_test.go
+@@ -2,7 +2,9 @@ package websocket
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+@@ -148,6 +150,59 @@ func TestHandleTerminalWSEnvironmentRouteReportsUnreadyExecution(t *testing.T) {
+ 	}
+ }
+ 
++// A terminal session will never gain an execution, so its shell handshake must
++// answer Gone rather than "retry later" — the 503 is what drove an open browser
++// tab to reconnect every few seconds forever.
++func TestHandleTerminalWSEnvironmentRouteGoneForTerminalSession(t *testing.T) {
++	log, _ := observedTerminalLogger(t)
++	handler, manager := newBridgeTestHandler(t, log)
++	manager.SetEnvironmentAccessChecker(func(context.Context, string) error {
++		return fmt.Errorf("verify session before registering execution: session %q is CANCELLED: %w", "session-1", lifecycle.ErrSessionTerminal)
++	})
++	c, recorder := terminalContext(t, "/environment/env-1", "?terminalId=t-1")
++
++	handler.HandleTerminalWS(c)
++
++	if recorder.Code != http.StatusGone {
++		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusGone)
++	}
++	var body map[string]string
++	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
++		t.Fatalf("decode response: %v", err)
++	}
++	if body["reason"] != terminalReasonSessionEnded {
++		t.Fatalf("reason = %q, want %q", body["reason"], terminalReasonSessionEnded)
++	}
++}
++
++// A plain GET (no Upgrade header) against a ready environment is a reconnect
++// probe: it reports readiness as JSON without starting a shell or upgrading.
++func TestHandleTerminalWSEnvironmentProbeReportsReadyWithoutStartingAShell(t *testing.T) {
++	log, _ := observedTerminalLogger(t)
++	handler, manager := newBridgeTestHandler(t, log)
++	if err := manager.ExecutionStoreForTesting().Add(&lifecycle.AgentExecution{
++		ID:                "exec-1",
++		SessionID:         "session-1",
++		TaskEnvironmentID: "env-1",
++	}); err != nil {
++		t.Fatalf("seed execution: %v", err)
++	}
++	c, recorder := terminalContext(t, "/environment/env-1", "?terminalId=t-1")
++
++	handler.HandleTerminalWS(c)
++
++	if recorder.Code != http.StatusOK {
++		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
++	}
++	var body map[string]any
++	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
++		t.Fatalf("decode response: %v", err)
++	}
++	if body["ready"] != true {
++		t.Fatalf("ready = %v, want true", body["ready"])
++	}
++}
++
+ // The passthrough terminal reaches the lifecycle manager directly, so a denied
+ // session must be refused before any WebSocket upgrade happens.
+ func TestHandleAgentPassthroughWSRefusesDeniedSession(t *testing.T) {

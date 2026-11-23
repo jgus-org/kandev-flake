@@ -1,0 +1,84 @@
+diff --git a/web/hooks/domains/session/use-session-message-fetch.test.ts b/web/hooks/domains/session/use-session-message-fetch.test.ts
+index 5c5be23..c487e0e 100644
+--- a/web/hooks/domains/session/use-session-message-fetch.test.ts
++++ b/web/hooks/domains/session/use-session-message-fetch.test.ts
+@@ -33,6 +33,33 @@ function makeParams(
+   };
+ }
+ 
++// Spies shared across sequential fetches so a test can watch what a rejected
++// fetch does to state an earlier fetch established.
++function makeObservedParams(
++  fetchAndStoreMessages: (
++    sessionId: string,
++    store: never,
++    isActive?: () => boolean,
++  ) => Promise<Message[]>,
++) {
++  const setMessages = vi.fn();
++  const setMessagesLoading = vi.fn();
++  const lastFetchedSessionIdRef = { current: null as string | null };
++  return {
++    setMessages,
++    lastFetchedSessionIdRef,
++    params: {
++      taskSessionId: SESSION_ID,
++      store: { getState: () => ({ setMessagesLoading, setMessages }) } as never,
++      setIsLoading: vi.fn(),
++      setIsWaitingForInitialMessages: vi.fn(),
++      initialFetchStartRef: { current: null },
++      lastFetchedSessionIdRef,
++      fetchAndStoreMessages,
++    },
++  };
++}
++
+ describe("doFetchMessages", () => {
+   it("settles a tool-only initial fetch without waiting for older history", async () => {
+     const setMessagesLoading = vi.fn();
+@@ -79,4 +106,28 @@ describe("doFetchMessages", () => {
+     await secondFetch;
+     expect(setMessagesLoading).toHaveBeenLastCalledWith(SESSION_ID, false);
+   });
++
++  it("leaves the transcript untouched and retryable when the fetch is rejected", async () => {
++    const rejection = vi.fn().mockRejectedValue(new Error("WebSocket request timed out"));
++    const observed = makeObservedParams(rejection);
++
++    await doFetchMessages(observed.params as never);
++
++    expect(observed.setMessages).not.toHaveBeenCalled();
++    expect(observed.lastFetchedSessionIdRef.current).toBeNull();
++  });
++
++  it("keeps a transcript loaded by an earlier fetch when a later fetch is rejected", async () => {
++    const observed = makeObservedParams(
++      vi.fn().mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("connection closed")),
++    );
++
++    await doFetchMessages(observed.params as never);
++    expect(observed.lastFetchedSessionIdRef.current).toBe(SESSION_ID);
++
++    await doFetchMessages(observed.params as never);
++
++    expect(observed.setMessages).not.toHaveBeenCalled();
++    expect(observed.lastFetchedSessionIdRef.current).toBe(SESSION_ID);
++  });
+ });
+diff --git a/web/hooks/domains/session/use-session-message-fetch.ts b/web/hooks/domains/session/use-session-message-fetch.ts
+index 174b936..cd2e13b 100644
+--- a/web/hooks/domains/session/use-session-message-fetch.ts
++++ b/web/hooks/domains/session/use-session-message-fetch.ts
+@@ -73,8 +73,10 @@ export async function doFetchMessages({
+     if (isInactive(isActive)) return;
+     if (onError) onError(error);
+     else console.error("Failed to fetch messages:", error);
+-    store.getState().setMessages(taskSessionId, []);
+-    lastFetchedSessionIdRef.current = taskSessionId;
++    // A rejected fetch says nothing about the transcript. Clearing the window
++    // discards messages already loaded for this session, and recording the
++    // session as fetched leaves every later mount without a retry, so one
++    // dropped request strands the transcript for the rest of the visit.
+   } finally {
+     if (endSessionFetch(taskSessionId)) {
+       store.getState().setMessagesLoading(taskSessionId, false);

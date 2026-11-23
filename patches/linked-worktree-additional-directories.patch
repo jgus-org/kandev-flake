@@ -1,0 +1,483 @@
+diff --git a/apps/backend/internal/agent/runtime/agentctl/agent.go b/apps/backend/internal/agent/runtime/agentctl/agent.go
+index 73ee433..4a5a8d0 100644
+--- a/apps/backend/internal/agent/runtime/agentctl/agent.go
++++ b/apps/backend/internal/agent/runtime/agentctl/agent.go
+@@ -95,11 +95,12 @@ type NewSessionResponse struct {
+ 
+ // createSessionRequest sends a session creation request and parses the response.
+ // Used by both NewSession and ResetSession which share the same payload/response format.
+-func (c *Client) createSessionRequest(ctx context.Context, action, cwd string, mcpServers []types.McpServer) (string, error) {
++func (c *Client) createSessionRequest(ctx context.Context, action, cwd string, mcpServers []types.McpServer, additionalDirectories []string) (string, error) {
+ 	payload := struct {
+-		Cwd        string            `json:"cwd"`
+-		McpServers []types.McpServer `json:"mcp_servers,omitempty"`
+-	}{Cwd: cwd, McpServers: mcpServers}
++		Cwd                   string            `json:"cwd"`
++		McpServers            []types.McpServer `json:"mcp_servers,omitempty"`
++		AdditionalDirectories []string          `json:"additional_directories,omitempty"`
++	}{Cwd: cwd, McpServers: mcpServers, AdditionalDirectories: additionalDirectories}
+ 
+ 	c.setLastSessionModelState(nil)
+ 	resp, err := c.sendStreamRequest(ctx, action, payload)
+@@ -128,23 +129,36 @@ func (c *Client) createSessionRequest(ctx context.Context, action, cwd string, m
+ 
+ // NewSession creates a new ACP session via the agent WebSocket stream.
+ func (c *Client) NewSession(ctx context.Context, cwd string, mcpServers []types.McpServer) (string, error) {
+-	return c.createSessionRequest(ctx, "agent.session.new", cwd, mcpServers)
++	return c.createSessionRequest(ctx, "agent.session.new", cwd, mcpServers, nil)
++}
++
++func (c *Client) NewSessionWithAdditionalDirectories(ctx context.Context, cwd string, mcpServers []types.McpServer, additionalDirectories []string) (string, error) {
++	return c.createSessionRequest(ctx, "agent.session.new", cwd, mcpServers, additionalDirectories)
+ }
+ 
+ // ResetSession creates a new session on the same connection, resetting context without
+ // restarting the subprocess. Returns the new session ID or an error if not supported.
+ func (c *Client) ResetSession(ctx context.Context, cwd string, mcpServers []types.McpServer) (string, error) {
+-	return c.createSessionRequest(ctx, "agent.session.reset", cwd, mcpServers)
++	return c.createSessionRequest(ctx, "agent.session.reset", cwd, mcpServers, nil)
++}
++
++func (c *Client) ResetSessionWithAdditionalDirectories(ctx context.Context, cwd string, mcpServers []types.McpServer, additionalDirectories []string) (string, error) {
++	return c.createSessionRequest(ctx, "agent.session.reset", cwd, mcpServers, additionalDirectories)
+ }
+ 
+ // LoadSession resumes an existing ACP session via the agent WebSocket stream.
+ // mcpServers are forwarded to the agentctl handler so agents that receive MCP configs
+ // via the protocol (e.g. Auggie) can reconnect to MCP servers on the new instance.
+ func (c *Client) LoadSession(ctx context.Context, sessionID string, mcpServers []types.McpServer) error {
++	return c.LoadSessionWithAdditionalDirectories(ctx, sessionID, mcpServers, nil)
++}
++
++func (c *Client) LoadSessionWithAdditionalDirectories(ctx context.Context, sessionID string, mcpServers []types.McpServer, additionalDirectories []string) error {
+ 	payload := struct {
+-		SessionID  string            `json:"session_id"`
+-		McpServers []types.McpServer `json:"mcp_servers,omitempty"`
+-	}{SessionID: sessionID, McpServers: mcpServers}
++		SessionID             string            `json:"session_id"`
++		McpServers            []types.McpServer `json:"mcp_servers,omitempty"`
++		AdditionalDirectories []string          `json:"additional_directories,omitempty"`
++	}{SessionID: sessionID, McpServers: mcpServers, AdditionalDirectories: additionalDirectories}
+ 
+ 	c.setLastSessionModelState(nil)
+ 	resp, err := c.sendStreamRequest(ctx, "agent.session.load", payload)
+diff --git a/apps/backend/internal/agent/runtime/agentctl/agent_test.go b/apps/backend/internal/agent/runtime/agentctl/agent_test.go
+index 356f472..522d355 100644
+--- a/apps/backend/internal/agent/runtime/agentctl/agent_test.go
++++ b/apps/backend/internal/agent/runtime/agentctl/agent_test.go
+@@ -462,6 +462,30 @@ func TestNewSession_Success(t *testing.T) {
+ 	}
+ }
+ 
++func TestNewSessionWithAdditionalDirectories(t *testing.T) {
++	c, ts := newTestClientWithStream(t, func(msg ws.Message) *ws.Message {
++		var payload struct {
++			AdditionalDirectories []string `json:"additional_directories"`
++		}
++		if err := msg.ParsePayload(&payload); err != nil {
++			t.Fatal(err)
++		}
++		if len(payload.AdditionalDirectories) != 1 || payload.AdditionalDirectories[0] != "/repo/.git" {
++			t.Fatalf("additional directories = %#v", payload.AdditionalDirectories)
++		}
++		resp, _ := ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
++			"success": true, "session_id": "sess-123",
++		})
++		return resp
++	})
++	defer ts.Close()
++	defer c.Close()
++
++	if _, err := c.NewSessionWithAdditionalDirectories(context.Background(), "/workspace", nil, []string{"/repo/.git"}); err != nil {
++		t.Fatal(err)
++	}
++}
++
+ func TestNewSession_Error(t *testing.T) {
+ 	c, ts := newTestClientWithStream(t, func(msg ws.Message) *ws.Message {
+ 		resp, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "agent not running", nil)
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/manager_interaction.go b/apps/backend/internal/agent/runtime/lifecycle/manager_interaction.go
+index 4aa8e6d..f1ab3b2 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/manager_interaction.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/manager_interaction.go
+@@ -790,7 +790,7 @@ func (m *Manager) ResetAgentContext(ctx context.Context, executionID string) err
+ 	}
+ 
+ 	// Try session-level reset (only ACP adapters support this)
+-	newSessionID, err := execution.agentctl.ResetSession(ctx, execution.WorkspacePath, mcpServers)
++	newSessionID, err := execution.agentctl.ResetSessionWithAdditionalDirectories(ctx, execution.WorkspacePath, mcpServers, workspaceGitAdditionalDirectories(execution.WorkspacePath))
+ 	if err != nil {
+ 		m.logger.Info("session reset not supported, falling back to process restart",
+ 			zap.String("execution_id", executionID), zap.Error(err))
+@@ -1183,6 +1183,7 @@ func (m *Manager) initializeACPSessionForRestart(
+ 		"", // empty — force session/new
+ 		execution.WorkspacePath,
+ 		mcpServers,
++		workspaceGitAdditionalDirectories(execution.WorkspacePath),
+ 	)
+ 	if err != nil {
+ 		return fmt.Errorf("ACP session initialization failed: %w", err)
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/session.go b/apps/backend/internal/agent/runtime/lifecycle/session.go
+index 19adcae..c1cb008 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/session.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/session.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"path/filepath"
+ 	"sort"
+ 	"strings"
+ 	"time"
+@@ -20,6 +21,7 @@ import (
+ 	agentctltypes "github.com/kandev/kandev/internal/agentctl/types"
+ 	"github.com/kandev/kandev/internal/agentctl/types/streams"
+ 	"github.com/kandev/kandev/internal/common/appctx"
++	"github.com/kandev/kandev/internal/common/gitref"
+ 	"github.com/kandev/kandev/internal/common/logger"
+ 	v1 "github.com/kandev/kandev/pkg/api/v1"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -32,6 +34,31 @@ const (
+ 	pendingDispatchedPromptWaitTimeout = 10 * time.Second
+ )
+ 
++func workspaceGitAdditionalDirectories(workspacePath string) []string {
++	gitDir, err := gitref.ResolveGitDir(workspacePath)
++	if err != nil {
++		return nil
++	}
++	commonDir := gitref.ResolveCommonGitDir(gitDir)
++	workspacePath, err = filepath.EvalSymlinks(workspacePath)
++	if err != nil {
++		return nil
++	}
++	gitDir, err = filepath.EvalSymlinks(gitDir)
++	if err != nil {
++		return nil
++	}
++	commonDir, err = filepath.EvalSymlinks(commonDir)
++	if err != nil {
++		return nil
++	}
++	relative, err := filepath.Rel(workspacePath, commonDir)
++	if err != nil || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
++		return nil
++	}
++	return []string{gitDir, commonDir}
++}
++
+ // PendingDispatchedPromptTimeoutError reports that a successor prompt could
+ // not observe completion of an earlier dispatch-only prompt within the
+ // bounded admission interval. The pending gate remains set so cancellation
+@@ -124,6 +151,7 @@ func (sm *SessionManager) InitializeSession(
+ 	existingSessionID string,
+ 	workspacePath string,
+ 	mcpServers []agentctltypes.McpServer,
++	additionalDirectories ...[]string,
+ ) (*InitializeResult, error) {
+ 	rt := agentConfig.Runtime()
+ 	sm.logger.Info("initializing ACP session",
+@@ -159,7 +187,11 @@ func (sm *SessionManager) InitializeSession(
+ 		zap.String("agent_version", result.AgentVersion))
+ 
+ 	// Step 2: Create or resume ACP session based on configuration
+-	sessionID, err := sm.createOrLoadSession(ctx, client, agentConfig, existingSessionID, workspacePath, mcpServers)
++	var directories []string
++	if len(additionalDirectories) != 0 {
++		directories = additionalDirectories[0]
++	}
++	sessionID, err := sm.createOrLoadSession(ctx, client, agentConfig, existingSessionID, workspacePath, mcpServers, directories)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -176,6 +208,7 @@ func (sm *SessionManager) createOrLoadSession(
+ 	existingSessionID string,
+ 	workspacePath string,
+ 	mcpServers []agentctltypes.McpServer,
++	additionalDirectories []string,
+ ) (string, error) {
+ 	rt := agentConfig.Runtime()
+ 	sm.logger.Debug("createOrLoadSession decision",
+@@ -184,7 +217,7 @@ func (sm *SessionManager) createOrLoadSession(
+ 		zap.String("existing_session_id", existingSessionID),
+ 		zap.Bool("will_attempt_load", rt.SessionConfig.NativeSessionResume && existingSessionID != ""))
+ 	if rt.SessionConfig.NativeSessionResume && existingSessionID != "" {
+-		sessionID, err := sm.loadSession(ctx, client, agentConfig, existingSessionID, mcpServers)
++		sessionID, err := sm.loadSession(ctx, client, agentConfig, existingSessionID, mcpServers, additionalDirectories)
+ 		if err == nil {
+ 			return sessionID, nil
+ 		}
+@@ -216,9 +249,9 @@ func (sm *SessionManager) createOrLoadSession(
+ 			zap.Bool("method_not_found", isMethodNotFoundErr(err)),
+ 			zap.Bool("capability_mismatch", strings.Contains(err.Error(), "LoadSession capability is false")),
+ 			zap.Bool("session_unknown", isSessionUnknownErr(err)))
+-		return sm.createNewSession(ctx, client, agentConfig, workspacePath, mcpServers)
++		return sm.createNewSession(ctx, client, agentConfig, workspacePath, mcpServers, additionalDirectories)
+ 	}
+-	return sm.createNewSession(ctx, client, agentConfig, workspacePath, mcpServers)
++	return sm.createNewSession(ctx, client, agentConfig, workspacePath, mcpServers, additionalDirectories)
+ }
+ 
+ // shouldInjectResumeContext determines if we should inject resume context for this session.
+@@ -266,12 +299,13 @@ func (sm *SessionManager) loadSession(
+ 	agentConfig agents.Agent,
+ 	sessionID string,
+ 	mcpServers []agentctltypes.McpServer,
++	additionalDirectories []string,
+ ) (string, error) {
+ 	sm.logger.Info("sending ACP session/load request",
+ 		zap.String("agent_type", agentConfig.ID()),
+ 		zap.String("session_id", sessionID))
+ 
+-	if err := client.LoadSession(ctx, sessionID, mcpServers); err != nil {
++	if err := client.LoadSessionWithAdditionalDirectories(ctx, sessionID, mcpServers, additionalDirectories); err != nil {
+ 		// context.Canceled is caller teardown (WS disconnect, session already
+ 		// gone) rather than an agent or transport fault, so it does not warrant
+ 		// an ERROR + stacktrace. DeadlineExceeded is a real startup/handshake
+@@ -306,12 +340,13 @@ func (sm *SessionManager) createNewSession(
+ 	agentConfig agents.Agent,
+ 	workspacePath string,
+ 	mcpServers []agentctltypes.McpServer,
++	additionalDirectories []string,
+ ) (string, error) {
+ 	sm.logger.Info("sending ACP session/new request",
+ 		zap.String("agent_type", agentConfig.ID()),
+ 		zap.String("workspace_path", workspacePath))
+ 
+-	sessionID, err := client.NewSession(ctx, workspacePath, mcpServers)
++	sessionID, err := client.NewSessionWithAdditionalDirectories(ctx, workspacePath, mcpServers, additionalDirectories)
+ 	if err != nil {
+ 		sm.logger.Error("ACP session/new failed",
+ 			zap.String("agent_type", agentConfig.ID()),
+@@ -527,7 +562,7 @@ func (sm *SessionManager) initializeACPConnection(
+ 			return ctx, nil, fmt.Errorf("timeout waiting for agent stream to connect")
+ 		}
+ 	}
+-	result, err := sm.InitializeSession(ctx, execution.agentctl, agentConfig, execution.ACPSessionID, execution.WorkspacePath, mcpServers)
++	result, err := sm.InitializeSession(ctx, execution.agentctl, agentConfig, execution.ACPSessionID, execution.WorkspacePath, mcpServers, workspaceGitAdditionalDirectories(execution.WorkspacePath))
+ 	if err != nil {
+ 		// loadSession already logged the root cause. context.Canceled is
+ 		// caller teardown, so keep this outer boundary at WARN too —
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/session_git_directories_test.go b/apps/backend/internal/agent/runtime/lifecycle/session_git_directories_test.go
+new file mode 100644
+index 0000000..f3fabfb
+--- /dev/null
++++ b/apps/backend/internal/agent/runtime/lifecycle/session_git_directories_test.go
+@@ -0,0 +1,47 @@
++package lifecycle
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++)
++
++func TestWorkspaceGitAdditionalDirectoriesUsesLinkedWorktreeCommonDir(t *testing.T) {
++	repository := t.TempDir()
++	runGitDirectoryTest(t, repository, "init", "--initial-branch=main")
++	runGitDirectoryTest(t, repository, "config", "user.name", "Test")
++	runGitDirectoryTest(t, repository, "config", "user.email", "test@example.invalid")
++	if err := os.WriteFile(filepath.Join(repository, "file"), []byte("base"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	runGitDirectoryTest(t, repository, "add", "file")
++	runGitDirectoryTest(t, repository, "commit", "-m", "base")
++	worktree := filepath.Join(t.TempDir(), "worktree")
++	runGitDirectoryTest(t, repository, "worktree", "add", "-b", "agent/test", worktree)
++
++	directories := workspaceGitAdditionalDirectories(worktree)
++	want, err := filepath.EvalSymlinks(filepath.Join(repository, ".git"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	wantGitDir, err := filepath.EvalSymlinks(filepath.Join(want, "worktrees", filepath.Base(worktree)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(directories) != 2 || directories[0] != wantGitDir || directories[1] != want {
++		t.Fatalf("additional directories = %#v, want [%q %q]", directories, wantGitDir, want)
++	}
++	if directories := workspaceGitAdditionalDirectories(repository); len(directories) != 0 {
++		t.Fatalf("standalone repository directories = %#v", directories)
++	}
++}
++
++func runGitDirectoryTest(t *testing.T, directory string, args ...string) {
++	t.Helper()
++	command := exec.Command("git", args...)
++	command.Dir = directory
++	if output, err := command.CombinedOutput(); err != nil {
++		t.Fatalf("git %v: %v: %s", args, err, output)
++	}
++}
+diff --git a/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session.go b/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session.go
+index 0925b80..fcdbce9 100644
+--- a/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session.go
++++ b/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session.go
+@@ -24,6 +24,10 @@ func (a *Adapter) PublishesMCPAttachmentResults() bool { return true }
+ 
+ // NewSession creates a new agent session.
+ func (a *Adapter) NewSession(ctx context.Context, mcpServers []types.McpServer) (string, error) {
++	return a.NewSessionWithAdditionalDirectories(ctx, mcpServers, nil)
++}
++
++func (a *Adapter) NewSessionWithAdditionalDirectories(ctx context.Context, mcpServers []types.McpServer, additionalDirectories []string) (string, error) {
+ 	a.mu.Lock()
+ 	conn := a.acpConn
+ 	a.mu.Unlock()
+@@ -60,8 +64,9 @@ func (a *Adapter) NewSession(ctx context.Context, mcpServers []types.McpServer)
+ 		a.emitMCPAttachmentEvidence(ctx, decision.Server, kind, decision.ReasonCode, "")
+ 	}
+ 	resp, err := conn.NewSession(ctx, acp.NewSessionRequest{
+-		Cwd:        a.cfg.WorkDir,
+-		McpServers: toACPMcpServers(filteredServers),
++		Cwd:                   a.cfg.WorkDir,
++		McpServers:            toACPMcpServers(filteredServers),
++		AdditionalDirectories: additionalDirectories,
+ 	})
+ 	if err != nil {
+ 		for _, server := range filteredServers {
+@@ -377,6 +382,10 @@ func mapToHTTPHeaders(headers map[string]string) []acp.HttpHeader {
+ //
+ //nolint:funlen // pre-existing length preserved from adapter.go file split
+ func (a *Adapter) LoadSession(ctx context.Context, sessionID string, mcpServers []types.McpServer) error {
++	return a.LoadSessionWithAdditionalDirectories(ctx, sessionID, mcpServers, nil)
++}
++
++func (a *Adapter) LoadSessionWithAdditionalDirectories(ctx context.Context, sessionID string, mcpServers []types.McpServer, additionalDirectories []string) error {
+ 	a.mu.Lock()
+ 	conn := a.acpConn
+ 	supportsLoad := a.capabilities.LoadSession
+@@ -432,9 +441,10 @@ func (a *Adapter) LoadSession(ctx context.Context, sessionID string, mcpServers
+ 	a.mu.Unlock()
+ 
+ 	resp, err := conn.LoadSession(ctx, acp.LoadSessionRequest{
+-		SessionId:  acp.SessionId(sessionID),
+-		Cwd:        a.cfg.WorkDir,
+-		McpServers: toACPMcpServers(filteredServers),
++		SessionId:             acp.SessionId(sessionID),
++		Cwd:                   a.cfg.WorkDir,
++		McpServers:            toACPMcpServers(filteredServers),
++		AdditionalDirectories: additionalDirectories,
+ 	})
+ 
+ 	if err != nil {
+@@ -532,6 +542,10 @@ func (a *Adapter) ResetSession(ctx context.Context, mcpServers []types.McpServer
+ 	return a.NewSession(ctx, mcpServers)
+ }
+ 
++func (a *Adapter) ResetSessionWithAdditionalDirectories(ctx context.Context, mcpServers []types.McpServer, additionalDirectories []string) (string, error) {
++	return a.NewSessionWithAdditionalDirectories(ctx, mcpServers, additionalDirectories)
++}
++
+ // emitReplayPlan re-emits the plan captured during session/load replay so the todo
+ // indicator survives a resume. An empty plan is dropped: on the ACP ingest path an
+ // empty entry list carries no information (same reasoning as extractTodoItems), and
+diff --git a/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session_test.go b/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session_test.go
+index fd7677f..274de61 100644
+--- a/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session_test.go
++++ b/apps/backend/internal/agentctl/server/adapter/transport/acp/adapter_session_test.go
+@@ -112,6 +112,23 @@ func TestMCPSessionNewAndLoadUseHTTPWithSSEFallback(t *testing.T) {
+ 	}
+ }
+ 
++func TestSessionAdditionalDirectoriesReachACP(t *testing.T) {
++	adapter, capture := newSessionRequestCaptureAdapter(t, acpsdk.McpCapabilities{})
++	directories := []string{"/repo/.git"}
++	if _, err := adapter.NewSessionWithAdditionalDirectories(context.Background(), nil, directories); err != nil {
++		t.Fatal(err)
++	}
++	if len(capture.newRequest.AdditionalDirectories) != 1 || capture.newRequest.AdditionalDirectories[0] != directories[0] {
++		t.Fatalf("new session directories = %#v", capture.newRequest.AdditionalDirectories)
++	}
++	if err := adapter.LoadSessionWithAdditionalDirectories(context.Background(), "session-1", nil, directories); err != nil {
++		t.Fatal(err)
++	}
++	if len(capture.loadRequest.AdditionalDirectories) != 1 || capture.loadRequest.AdditionalDirectories[0] != directories[0] {
++		t.Fatalf("load session directories = %#v", capture.loadRequest.AdditionalDirectories)
++	}
++}
++
+ func TestResetSessionInvalidatesPromptOwnership(t *testing.T) {
+ 	adapter, _ := newSessionRequestCaptureAdapter(t, acpsdk.McpCapabilities{})
+ 
+diff --git a/apps/backend/internal/agentctl/server/api/agent.go b/apps/backend/internal/agentctl/server/api/agent.go
+index 4c13d24..3cce2b8 100644
+--- a/apps/backend/internal/agentctl/server/api/agent.go
++++ b/apps/backend/internal/agentctl/server/api/agent.go
+@@ -54,8 +54,9 @@ type InitializeResponse struct {
+ 
+ // NewSessionRequest is a request to create a new ACP session
+ type NewSessionRequest struct {
+-	Cwd        string            `json:"cwd"` // Working directory for the session
+-	McpServers []types.McpServer `json:"mcp_servers,omitempty"`
++	Cwd                   string            `json:"cwd"` // Working directory for the session
++	McpServers            []types.McpServer `json:"mcp_servers,omitempty"`
++	AdditionalDirectories []string          `json:"additional_directories,omitempty"`
+ }
+ 
+ // NewSessionResponse is the response to a new session call
+@@ -68,8 +69,9 @@ type NewSessionResponse struct {
+ 
+ // LoadSessionRequest is a request to load an existing ACP session
+ type LoadSessionRequest struct {
+-	SessionID  string            `json:"session_id"`
+-	McpServers []types.McpServer `json:"mcp_servers,omitempty"`
++	SessionID             string            `json:"session_id"`
++	McpServers            []types.McpServer `json:"mcp_servers,omitempty"`
++	AdditionalDirectories []string          `json:"additional_directories,omitempty"`
+ }
+ 
+ // LoadSessionResponse is the response to a load session call
+@@ -542,7 +544,15 @@ func (s *Server) handleWSNewSession(ctx context.Context, msg *ws.Message) *ws.Me
+ 
+ 	ctx = s.startMCPAttachmentAttempt(ctx, mcpServers)
+ 	attachmentContext, _ := streams.MCPAttachmentContextFromContext(ctx)
+-	sessionID, err := adapter.NewSession(ctx, mcpServers)
++	var sessionID string
++	var err error
++	if extended, ok := adapter.(interface {
++		NewSessionWithAdditionalDirectories(context.Context, []types.McpServer, []string) (string, error)
++	}); ok {
++		sessionID, err = extended.NewSessionWithAdditionalDirectories(ctx, mcpServers, req.AdditionalDirectories)
++	} else {
++		sessionID, err = adapter.NewSession(ctx, mcpServers)
++	}
+ 	s.publishMCPAttachmentResult(attachmentContext.Attempt.AttemptID, mcpServers, err)
+ 	if err != nil {
+ 		s.logger.Error("new session failed", zap.Error(err))
+@@ -593,7 +603,15 @@ func (s *Server) handleWSLoadSession(ctx context.Context, msg *ws.Message) *ws.M
+ 
+ 	ctx = s.startMCPAttachmentAttempt(ctx, mcpServers)
+ 	attachmentContext, _ := streams.MCPAttachmentContextFromContext(ctx)
+-	if err := adapter.LoadSession(ctx, req.SessionID, mcpServers); err != nil {
++	var err error
++	if extended, ok := adapter.(interface {
++		LoadSessionWithAdditionalDirectories(context.Context, string, []types.McpServer, []string) error
++	}); ok {
++		err = extended.LoadSessionWithAdditionalDirectories(ctx, req.SessionID, mcpServers, req.AdditionalDirectories)
++	} else {
++		err = adapter.LoadSession(ctx, req.SessionID, mcpServers)
++	}
++	if err != nil {
+ 		s.publishMCPAttachmentResult(attachmentContext.Attempt.AttemptID, mcpServers, err)
+ 		s.logger.Error("load session failed", zap.Error(err))
+ 		resp, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, err.Error(), nil)
+@@ -841,7 +859,15 @@ func (s *Server) handleWSResetSession(ctx context.Context, msg *ws.Message) *ws.
+ 
+ 	ctx = s.startMCPAttachmentAttempt(ctx, mcpServers)
+ 	attachmentContext, _ := streams.MCPAttachmentContextFromContext(ctx)
+-	sessionID, err := sr.ResetSession(ctx, mcpServers)
++	var sessionID string
++	var err error
++	if extended, ok := agentAdapter.(interface {
++		ResetSessionWithAdditionalDirectories(context.Context, []types.McpServer, []string) (string, error)
++	}); ok {
++		sessionID, err = extended.ResetSessionWithAdditionalDirectories(ctx, mcpServers, req.AdditionalDirectories)
++	} else {
++		sessionID, err = sr.ResetSession(ctx, mcpServers)
++	}
+ 	s.publishMCPAttachmentResult(attachmentContext.Attempt.AttemptID, mcpServers, err)
+ 	if err != nil {
+ 		s.logger.Error("session reset failed", zap.Error(err))

@@ -1,0 +1,126 @@
+diff --git a/apps/backend/internal/agent/agents/qwen_acp.go b/apps/backend/internal/agent/agents/qwen_acp.go
+--- a/apps/backend/internal/agent/agents/qwen_acp.go
++++ b/apps/backend/internal/agent/agents/qwen_acp.go
+@@ -3,6 +3,7 @@ package agents
+ import (
+ 	"context"
+ 	_ "embed"
++	"os"
+ 	"time"
+ 
+ 	"github.com/kandev/kandev/internal/agent/usage"
+@@ -17,6 +18,14 @@ var qwenACPLogoDark []byte
+ 
+ const qwenACPPkg = "@qwen-code/qwen-code"
+ 
++func qwenACPCommand(args ...string) Command {
++	command := []string{"npx", "-y", qwenACPPkg}
++	if executable := os.Getenv("QWEN_CODE_PATH"); executable != "" {
++		command = []string{executable}
++	}
++	return NewCommand(append(command, args...)...)
++}
++
+ var (
+ 	_ Agent            = (*QwenACP)(nil)
+ 	_ PassthroughAgent = (*QwenACP)(nil)
+@@ -35,7 +44,7 @@ func NewQwenACP() *QwenACP {
+ 				Supported:      true,
+ 				Label:          "CLI Passthrough",
+ 				Description:    "Show terminal directly instead of chat interface",
+-				PassthroughCmd: NewCommand("npx", "-y", qwenACPPkg),
++				PassthroughCmd: qwenACPCommand(),
+ 				ModelFlag:      NewParam("--model", "{model}"),
+ 				IdleTimeout:    3 * time.Second,
+ 				BufferMaxBytes: DefaultBufferMaxBytes,
+@@ -62,7 +71,11 @@ func (a *QwenACP) Logo(v LogoVariant) []byte {
+ }
+ 
+ func (a *QwenACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+-	result, err := Detect(ctx, WithCommand("qwen"))
++	executable := os.Getenv("QWEN_CODE_PATH")
++	if executable == "" {
++		executable = "qwen"
++	}
++	result, err := Detect(ctx, WithCommand(executable))
+ 	if err != nil {
+ 		return result, err
+ 	}
+@@ -74,13 +87,13 @@ func (a *QwenACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+ }
+ 
+ func (a *QwenACP) BuildCommand(opts CommandOptions) Command {
+-	return Cmd("npx", "-y", qwenACPPkg, "--acp").Build()
++	return qwenACPCommand("--acp")
+ }
+ 
+ func (a *QwenACP) Runtime() *RuntimeConfig {
+ 	canRecover := true
+ 	return &RuntimeConfig{
+-		Cmd:            Cmd("npx", "-y", qwenACPPkg, "--acp").Build(),
++		Cmd:            qwenACPCommand("--acp"),
+ 		WorkingDir:     "{workspace}",
+ 		Env:            map[string]string{},
+ 		ResourceLimits: ResourceLimits{MemoryMB: 4096, CPUCores: 2.0, Timeout: time.Hour},
+@@ -106,7 +119,7 @@ func (a *QwenACP) PermissionSettings() map[string]PermissionSetting {
+ func (a *QwenACP) InferenceConfig() *InferenceConfig {
+ 	return &InferenceConfig{
+ 		Supported: true,
+-		Command:   NewCommand("npx", "-y", qwenACPPkg, "--acp"),
++		Command:   qwenACPCommand("--acp"),
+ 	}
+ }
+ 
+diff --git a/apps/backend/internal/agent/agents/qwen_acp_test.go b/apps/backend/internal/agent/agents/qwen_acp_test.go
+new file mode 100644
+--- /dev/null
++++ b/apps/backend/internal/agent/agents/qwen_acp_test.go
+@@ -0,0 +1,37 @@
++package agents
++
++import (
++	"slices"
++	"testing"
++)
++
++func TestQwenACPExecutableOverride(t *testing.T) {
++	for _, tt := range []struct {
++		name       string
++		executable string
++		command    []string
++	}{
++		{name: "default", command: []string{"npx", "-y", qwenACPPkg}},
++		{name: "override", executable: "/opt/qwen code/bin/qwen", command: []string{"/opt/qwen code/bin/qwen"}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Setenv("QWEN_CODE_PATH", tt.executable)
++			a := NewQwenACP()
++			acp := append(slices.Clone(tt.command), "--acp")
++			for name, command := range map[string]Command{
++				"launch":    a.BuildCommand(CommandOptions{}),
++				"runtime":   a.Runtime().Cmd,
++				"inference": a.InferenceConfig().Command,
++			} {
++				if got := command.Args(); !slices.Equal(got, acp) {
++					t.Errorf("%s = %q, want %q", name, got, acp)
++				}
++			}
++			passthrough := a.BuildPassthroughCommand(PassthroughOptions{Model: "local-model"}).Args()
++			want := append(slices.Clone(tt.command), "--model", "local-model")
++			if !slices.Equal(passthrough, want) {
++				t.Errorf("passthrough = %q, want %q", passthrough, want)
++			}
++		})
++	}
++}
+diff --git a/apps/backend/internal/agentctl/server/utility/acp_executor.go b/apps/backend/internal/agentctl/server/utility/acp_executor.go
+--- a/apps/backend/internal/agentctl/server/utility/acp_executor.go
++++ b/apps/backend/internal/agentctl/server/utility/acp_executor.go
+@@ -1195,6 +1195,7 @@ var allowedProbeCommands = map[string]string{
+ 	"omp":           "omp",
+ 	openCodeCommand: openCodeCommand,
+ 	"qodercli":      "qodercli",
++	"qwen":          "qwen",
+ 	"traecli":       "traecli",
+ }
+ 

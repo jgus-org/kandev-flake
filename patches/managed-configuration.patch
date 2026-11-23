@@ -1,0 +1,1721 @@
+diff --git a/apps/backend/internal/backendapp/main.go b/apps/backend/internal/backendapp/main.go
+index e01b401f..d76940bf 100644
+--- a/apps/backend/internal/backendapp/main.go
++++ b/apps/backend/internal/backendapp/main.go
+@@ -948,6 +948,14 @@ func startGatewayAndServe(
+ 		handler, server, listeners = h, s, l
+ 		return nil
+ 	}
++	if services.Plugins != nil {
++		messenger := pluginsTaskMessengerAdapter{tasks: services.Task, orch: orchestratorSvc, log: log}
++		services.Plugins.SetWriteDeps(messenger, pluginsTaskStarterAdapter{orch: orchestratorSvc, log: log})
++	}
++	if err := applyManagedConfiguration(ctx, cfg, log, repos, services, agentSettingsController); err != nil {
++		log.Error("Failed to apply managed configuration", zap.Error(err))
++		return false
++	}
+ 
+ 	if err := startOrchestratorAndAutomationConsumers(
+ 		bindListeners,
+@@ -979,23 +987,6 @@ func startGatewayAndServe(
+ 	}
+ 	log.Info("Orchestrator initialized")
+ 
+-	// Wire the Host data API's late write dependencies (ADR 0043 phase 2): the
+-	// task-message delivery path backs SendMessage (api_write:messages), and
+-	// the orchestrator backs CreateTask's start_agent. The orchestrator is
+-	// constructed after StartActivePlugins spawns boot-active plugins, so the
+-	// plugins service reads these live rather than snapshotting (see
+-	// SetWriteDeps).
+-	//
+-	// Deliberately wired here rather than inside initOfficeServices: that
+-	// function returns early when features.office=false (the production
+-	// default), while plugins start whenever services.Plugins is non-nil.
+-	// Wiring it there would leave every default production backend with
+-	// Unimplemented SendMessage and a silently no-op start_agent.
+-	if services.Plugins != nil {
+-		messenger := pluginsTaskMessengerAdapter{tasks: services.Task, orch: orchestratorSvc, log: log}
+-		services.Plugins.SetWriteDeps(messenger, pluginsTaskStarterAdapter{orch: orchestratorSvc, log: log})
+-	}
+-
+ 	// ============================================
+ 	// OFFICE FEATURES + GLOBAL RUN SCHEDULING
+ 	// ============================================
+diff --git a/apps/backend/internal/backendapp/managed_config.go b/apps/backend/internal/backendapp/managed_config.go
+new file mode 100644
+index 00000000..8173c145
+--- /dev/null
++++ b/apps/backend/internal/backendapp/managed_config.go
+@@ -0,0 +1,591 @@
++package backendapp
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"reflect"
++	"strings"
++
++	"golang.org/x/crypto/ssh"
++
++	agentlifecycle "github.com/kandev/kandev/internal/agent/runtime/lifecycle"
++	agentsettingscontroller "github.com/kandev/kandev/internal/agent/settings/controller"
++	agentsettingsdto "github.com/kandev/kandev/internal/agent/settings/dto"
++	"github.com/kandev/kandev/internal/common/config"
++	"github.com/kandev/kandev/internal/common/logger"
++	"github.com/kandev/kandev/internal/github"
++	pluginstore "github.com/kandev/kandev/internal/plugins/store"
++	"github.com/kandev/kandev/internal/secrets"
++	taskmodels "github.com/kandev/kandev/internal/task/models"
++	taskservice "github.com/kandev/kandev/internal/task/service"
++	workflowmodels "github.com/kandev/kandev/internal/workflow/models"
++)
++
++type managedReferences struct {
++	secrets       map[string]string
++	agentProfiles map[string]string
++}
++
++func applyManagedConfiguration(
++	ctx context.Context,
++	cfg *config.Config,
++	log *logger.Logger,
++	repos *Repositories,
++	services *Services,
++	agents *agentsettingscontroller.Controller,
++) error {
++	managed := cfg.Managed
++	if reflect.DeepEqual(managed, config.ManagedConfig{}) {
++		return nil
++	}
++	refs := &managedReferences{
++		secrets:       make(map[string]string),
++		agentProfiles: make(map[string]string),
++	}
++	if err := applyManagedPlugins(ctx, services, managed.Plugins); err != nil {
++		return err
++	}
++	if err := applyManagedSecrets(ctx, log, repos, managed.Secrets, refs); err != nil {
++		return err
++	}
++	if err := applyManagedAgents(ctx, agents, repos.Office, managed.Agents, refs); err != nil {
++		return err
++	}
++	if err := applyManagedExecutors(ctx, services, managed.Executors, refs); err != nil {
++		return err
++	}
++	for _, workspace := range managed.Workspaces {
++		if err := applyManagedWorkspace(ctx, repos, services, workspace, refs); err != nil {
++			return fmt.Errorf("managed workspace %q: %w", workspace.Name, err)
++		}
++	}
++	return nil
++}
++
++type managedInstructionStore interface {
++	UpsertInstruction(ctx context.Context, agentProfileID, filename, content string, isEntry bool) error
++}
++
++func reconcileManagedProfileInstructions(
++	ctx context.Context,
++	store managedInstructionStore,
++	agentProfileID string,
++	instructions *string,
++) error {
++	if instructions == nil {
++		return nil
++	}
++	return store.UpsertInstruction(ctx, agentProfileID, "AGENTS.md", *instructions, true)
++}
++
++func applyManagedPlugins(ctx context.Context, services *Services, desired []config.ManagedPlugin) error {
++	if len(desired) > 0 && services.Plugins == nil {
++		return fmt.Errorf("plugin service is unavailable")
++	}
++	for _, plugin := range desired {
++		current, err := services.Plugins.Get(plugin.ID)
++		if err != nil && !errors.Is(err, pluginstore.ErrNotFound) {
++			return fmt.Errorf("read plugin %q: %w", plugin.ID, err)
++		}
++		if errors.Is(err, pluginstore.ErrNotFound) || current.Version != plugin.Version {
++			file, openErr := os.Open(plugin.PackageFile)
++			if openErr != nil {
++				return fmt.Errorf("open plugin package %q: %w", plugin.PackageFile, openErr)
++			}
++			_, installErr := services.Plugins.Install(ctx, file)
++			closeErr := file.Close()
++			if installErr != nil {
++				return fmt.Errorf("install plugin %q: %w", plugin.ID, installErr)
++			}
++			if closeErr != nil {
++				return fmt.Errorf("close plugin package %q: %w", plugin.PackageFile, closeErr)
++			}
++		}
++		if err := services.Plugins.Enable(plugin.ID); err != nil {
++			return fmt.Errorf("enable plugin %q: %w", plugin.ID, err)
++		}
++	}
++	return nil
++}
++
++func applyManagedSecrets(
++	ctx context.Context,
++	log *logger.Logger,
++	repos *Repositories,
++	desired []config.ManagedSecret,
++	refs *managedReferences,
++) error {
++	service := secrets.NewService(repos.Secrets, log)
++	existing, err := service.ListScoped(ctx, secrets.SecretListOptions{Scope: secrets.ScopeGlobal})
++	if err != nil {
++		return fmt.Errorf("list managed secrets: %w", err)
++	}
++	for _, item := range desired {
++		value, err := readManagedSecret(item.ValueFile)
++		if err != nil {
++			return err
++		}
++		matches := make([]*secrets.SecretListItem, 0, 1)
++		for index := range existing {
++			if existing[index].Name == item.Name {
++				matches = append(matches, existing[index])
++			}
++		}
++		if len(matches) > 1 {
++			return fmt.Errorf("multiple global secrets are named %q", item.Name)
++		}
++		if len(matches) == 0 {
++			created, err := service.Create(ctx, &secrets.CreateSecretRequest{Name: item.Name, Value: value, Scope: secrets.ScopeGlobal})
++			if err != nil {
++				return fmt.Errorf("create secret %q: %w", item.Name, err)
++			}
++			refs.secrets[item.Name] = created.ID
++			continue
++		}
++		current, err := service.Reveal(ctx, matches[0].ID)
++		if err != nil {
++			return fmt.Errorf("read secret %q: %w", item.Name, err)
++		}
++		if current != value {
++			if _, err := service.Update(ctx, matches[0].ID, &secrets.UpdateSecretRequest{Value: &value}); err != nil {
++				return fmt.Errorf("update secret %q: %w", item.Name, err)
++			}
++		}
++		refs.secrets[item.Name] = matches[0].ID
++	}
++	return nil
++}
++
++func applyManagedAgents(
++	ctx context.Context,
++	controller *agentsettingscontroller.Controller,
++	instructions managedInstructionStore,
++	desired []config.ManagedAgent,
++	refs *managedReferences,
++) error {
++	response, err := controller.ListAgents(ctx)
++	if err != nil {
++		return fmt.Errorf("list agents: %w", err)
++	}
++	for _, configuredAgent := range desired {
++		var agent *agentsettingsdto.AgentDTO
++		for index := range response.Agents {
++			if response.Agents[index].Name == configuredAgent.Name {
++				agent = &response.Agents[index]
++				break
++			}
++		}
++		if agent == nil {
++			created, err := controller.CreateAgent(ctx, agentsettingscontroller.CreateAgentRequest{Name: configuredAgent.Name})
++			if err != nil {
++				return fmt.Errorf("create agent %q: %w", configuredAgent.Name, err)
++			}
++			agent = created
++		}
++		for _, configuredProfile := range configuredAgent.Profiles {
++			environment, err := managedAgentEnvironment(configuredProfile.Environment, refs.secrets)
++			if err != nil {
++				return fmt.Errorf("agent profile %q/%q: %w", configuredAgent.Name, configuredProfile.Name, err)
++			}
++			var current *agentsettingsdto.AgentProfileDTO
++			for index := range agent.Profiles {
++				if agent.Profiles[index].Name == configuredProfile.Name {
++					current = &agent.Profiles[index]
++					break
++				}
++			}
++			if current == nil {
++				created, err := controller.CreateProfile(ctx, agentsettingscontroller.CreateProfileRequest{
++					AgentID: agent.ID, Name: configuredProfile.Name, Model: configuredProfile.Model,
++					FallbackModel: configuredProfile.FallbackModel, AutoFallback: configuredProfile.AutoFallback,
++					AllowIndexing: configuredProfile.AllowIndexing, AutoApprove: configuredProfile.AutoApprove,
++					CLIPassthrough: configuredProfile.CLIPassthrough, EnvVars: environment,
++				})
++				if err != nil {
++					return fmt.Errorf("create agent profile %q/%q: %w", configuredAgent.Name, configuredProfile.Name, err)
++				}
++				current = created
++			} else {
++				name := configuredProfile.Name
++				model := configuredProfile.Model
++				fallbackModel := configuredProfile.FallbackModel
++				autoFallback := configuredProfile.AutoFallback
++				allowIndexing := configuredProfile.AllowIndexing
++				autoApprove := configuredProfile.AutoApprove
++				cliPassthrough := configuredProfile.CLIPassthrough
++				enabled := configuredProfile.Enabled
++				updated, err := controller.UpdateProfile(ctx, agentsettingscontroller.UpdateProfileRequest{
++					ID: current.ID, Name: &name, Model: &model, FallbackModel: &fallbackModel,
++					AutoFallback: &autoFallback, AllowIndexing: &allowIndexing, AutoApprove: &autoApprove,
++					CLIPassthrough: &cliPassthrough, Enabled: &enabled, EnvVars: &environment, Force: true,
++				})
++				if err != nil {
++					return fmt.Errorf("update agent profile %q/%q: %w", configuredAgent.Name, configuredProfile.Name, err)
++				}
++				current = updated
++			}
++			if err := reconcileManagedProfileInstructions(ctx, instructions, current.ID, configuredProfile.Instructions); err != nil {
++				return fmt.Errorf("reconcile instructions for agent profile %q/%q: %w", configuredAgent.Name, configuredProfile.Name, err)
++			}
++			refs.agentProfiles[configuredAgent.Name+"/"+configuredProfile.Name] = current.ID
++		}
++	}
++	return nil
++}
++
++func applyManagedExecutors(
++	ctx context.Context,
++	services *Services,
++	desired []config.ManagedExecutor,
++	refs *managedReferences,
++) error {
++	executors, err := services.Task.ListExecutors(ctx)
++	if err != nil {
++		return fmt.Errorf("list executors: %w", err)
++	}
++	for _, configured := range desired {
++		executorConfig := cloneStringMap(configured.Config)
++		if configured.SSHHostPublicKey != "" {
++			algorithm, fingerprint, err := parseSSHHostPublicKey(configured.SSHHostPublicKey)
++			if err != nil {
++				return fmt.Errorf("executor %q: %w", configured.Name, err)
++			}
++			executorConfig["ssh_host_key_algorithm"] = algorithm
++			executorConfig["ssh_host_fingerprint"] = fingerprint
++		}
++		var executor *taskmodels.Executor
++		for _, candidate := range executors {
++			if candidate.Name == configured.Name {
++				executor = candidate
++				break
++			}
++		}
++		if executor == nil {
++			created, err := services.Task.CreateExecutor(ctx, &taskservice.CreateExecutorRequest{
++				Name: configured.Name, Type: taskmodels.ExecutorType(configured.Type),
++				Status: taskmodels.ExecutorStatus(configured.Status), Resumable: configured.Resumable, Config: executorConfig,
++			})
++			if err != nil {
++				return fmt.Errorf("create executor %q: %w", configured.Name, err)
++			}
++			executor = created
++		} else {
++			name := configured.Name
++			typeName := taskmodels.ExecutorType(configured.Type)
++			status := taskmodels.ExecutorStatus(configured.Status)
++			resumable := configured.Resumable
++			updated, err := services.Task.UpdateExecutor(ctx, executor.ID, &taskservice.UpdateExecutorRequest{
++				Name: &name, Type: &typeName, Status: &status, Resumable: &resumable, Config: executorConfig,
++			})
++			if err != nil {
++				return fmt.Errorf("update executor %q: %w", configured.Name, err)
++			}
++			executor = updated
++		}
++		profiles, err := services.Task.ListExecutorProfiles(ctx, executor.ID)
++		if err != nil {
++			return fmt.Errorf("list executor profiles for %q: %w", configured.Name, err)
++		}
++		for _, configuredProfile := range configured.Profiles {
++			environment, err := managedExecutorEnvironment(configuredProfile.Environment, refs.secrets)
++			if err != nil {
++				return fmt.Errorf("executor profile %q/%q: %w", configured.Name, configuredProfile.Name, err)
++			}
++			prepareScript := configuredProfile.PrepareScript
++			if prepareScript == "default" {
++				prepareScript = agentlifecycle.DefaultPrepareScript(configured.Type)
++			}
++			var profile *taskmodels.ExecutorProfile
++			for _, candidate := range profiles {
++				if candidate.Name == configuredProfile.Name {
++					profile = candidate
++					break
++				}
++			}
++			if profile == nil {
++				created, err := services.Task.CreateExecutorProfile(ctx, &taskservice.CreateExecutorProfileRequest{
++					ExecutorID: executor.ID, Name: configuredProfile.Name, McpPolicy: configuredProfile.MCPPolicy,
++					Config: configuredProfile.Config, PrepareScript: prepareScript,
++					CleanupScript: configuredProfile.CleanupScript, EnvVars: environment,
++				})
++				if err != nil {
++					return fmt.Errorf("create executor profile %q/%q: %w", configured.Name, configuredProfile.Name, err)
++				}
++				profile = created
++			} else {
++				name := configuredProfile.Name
++				mcpPolicy := configuredProfile.MCPPolicy
++				cleanupScript := configuredProfile.CleanupScript
++				updated, err := services.Task.UpdateExecutorProfile(ctx, profile.ID, &taskservice.UpdateExecutorProfileRequest{
++					Name: &name, McpPolicy: &mcpPolicy, Config: configuredProfile.Config,
++					PrepareScript: &prepareScript, CleanupScript: &cleanupScript, EnvVars: environment,
++				})
++				if err != nil {
++					return fmt.Errorf("update executor profile %q/%q: %w", configured.Name, configuredProfile.Name, err)
++				}
++				profile = updated
++			}
++		}
++	}
++	return nil
++}
++
++func applyManagedWorkspace(
++	ctx context.Context,
++	repos *Repositories,
++	services *Services,
++	desired config.ManagedWorkspace,
++	refs *managedReferences,
++) error {
++	workspaces, err := services.Task.ListWorkspaces(ctx)
++	if err != nil {
++		return err
++	}
++	var workspace *taskmodels.Workspace
++	for _, candidate := range workspaces {
++		if candidate.Name == desired.Name {
++			if workspace != nil {
++				return fmt.Errorf("multiple workspaces are named %q", desired.Name)
++			}
++			workspace = candidate
++		}
++	}
++	if workspace == nil {
++		return fmt.Errorf("workspace does not exist")
++	}
++	for _, workflow := range desired.Workflows {
++		if err := applyManagedWorkflow(ctx, services, workspace.ID, workflow, refs); err != nil {
++			return err
++		}
++	}
++	if desired.DefaultAgentProfile != "" {
++		profileID, ok := refs.agentProfiles[desired.DefaultAgentProfile]
++		if !ok {
++			return fmt.Errorf("agent profile %q is not managed", desired.DefaultAgentProfile)
++		}
++		if _, err := services.Task.UpdateWorkspace(ctx, workspace.ID, &taskservice.UpdateWorkspaceRequest{DefaultAgentProfileID: &profileID}); err != nil {
++			return err
++		}
++	}
++	if desired.BranchPrefix != "" || desired.BranchTemplate != "" {
++		if err := services.Task.SetRepositoryBranchDefaults(workspace.ID, desired.BranchPrefix, desired.BranchTemplate); err != nil {
++			return err
++		}
++		repositories, err := services.Task.ListRepositories(ctx, workspace.ID)
++		if err != nil {
++			return err
++		}
++		for _, repository := range repositories {
++			if _, err := services.Task.UpdateRepository(ctx, repository.ID, &taskservice.UpdateRepositoryRequest{
++				WorktreeBranchPrefix: &desired.BranchPrefix, WorktreeBranchTemplate: &desired.BranchTemplate,
++			}); err != nil {
++				return fmt.Errorf("update repository %q branches: %w", repository.Name, err)
++			}
++		}
++	}
++	if desired.GitHub != nil {
++		if err := applyManagedGitHub(ctx, repos, services, workspace.ID, *desired.GitHub); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func applyManagedWorkflow(
++	ctx context.Context,
++	services *Services,
++	workspaceID string,
++	desired config.ManagedWorkflow,
++	refs *managedReferences,
++) error {
++	workflows, err := services.Task.ListWorkflows(ctx, workspaceID, true)
++	if err != nil {
++		return err
++	}
++	var workflow *taskmodels.Workflow
++	for _, candidate := range workflows {
++		if candidate.Name == desired.Name {
++			if workflow != nil {
++				return fmt.Errorf("multiple workflows are named %q", desired.Name)
++			}
++			workflow = candidate
++		}
++	}
++	profileID := ""
++	if desired.AgentProfile != "" {
++		var ok bool
++		profileID, ok = refs.agentProfiles[desired.AgentProfile]
++		if !ok {
++			return fmt.Errorf("agent profile %q is not managed", desired.AgentProfile)
++		}
++	}
++	if workflow == nil {
++		created, err := services.Task.CreateWorkflow(ctx, &taskservice.CreateWorkflowRequest{
++			WorkspaceID: workspaceID, Name: desired.Name, Description: desired.Description, Prompt: desired.Prompt,
++		})
++		if err != nil {
++			return fmt.Errorf("create workflow %q: %w", desired.Name, err)
++		}
++		workflow = created
++	}
++	if _, err := services.Task.UpdateWorkflow(ctx, workflow.ID, &taskservice.UpdateWorkflowRequest{
++		Name: &desired.Name, Description: &desired.Description, Prompt: &desired.Prompt, AgentProfileID: &profileID,
++	}); err != nil {
++		return fmt.Errorf("update workflow %q: %w", desired.Name, err)
++	}
++	steps, err := services.Workflow.ListStepsByWorkflow(ctx, workflow.ID)
++	if err != nil {
++		return err
++	}
++	for position, desiredStep := range desired.Steps {
++		var step *workflowmodels.WorkflowStep
++		for _, candidate := range steps {
++			if candidate.Name == desiredStep.Name {
++				if step != nil {
++					return fmt.Errorf("multiple workflow steps are named %q", desiredStep.Name)
++				}
++				step = candidate
++			}
++		}
++		events, err := decodeManagedStepEvents(desiredStep.Events)
++		if err != nil {
++			return fmt.Errorf("workflow step %q: %w", desiredStep.Name, err)
++		}
++		if step == nil {
++			step = &workflowmodels.WorkflowStep{WorkflowID: workflow.ID}
++		}
++		step.Name = desiredStep.Name
++		step.Position = position * 100
++		step.Color = desiredStep.Color
++		step.Prompt = desiredStep.Prompt
++		step.Events = events
++		step.AllowManualMove = desiredStep.AllowManualMove
++		step.IsStartStep = desiredStep.IsStartStep
++		step.ShowInCommandPanel = desiredStep.ShowInCommandPanel
++		step.StageType = workflowmodels.StageType(desiredStep.StageType)
++		if step.ID == "" {
++			if err := services.Workflow.CreateStep(ctx, step); err != nil {
++				return err
++			}
++		} else if err := services.Workflow.UpdateStep(ctx, step); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func applyManagedGitHub(
++	ctx context.Context,
++	repos *Repositories,
++	services *Services,
++	workspaceID string,
++	desired config.ManagedGitHub,
++) error {
++	token, err := readManagedSecret(desired.TokenFile)
++	if err != nil {
++		return err
++	}
++	storedToken, _ := repos.Secrets.Reveal(ctx, github.WorkspacePATSecretKey(workspaceID))
++	status, statusErr := services.GitHub.GetWorkspaceAuthStatus(ctx, workspaceID, "")
++	if statusErr != nil || status.AuthMethod != string(github.ConnectionSourcePAT) || storedToken != token {
++		if _, err := services.GitHub.SetWorkspaceConnection(ctx, workspaceID, github.SetWorkspaceConnectionRequest{
++			Source: github.ConnectionSourcePAT, Token: token,
++		}); err != nil {
++			return fmt.Errorf("configure GitHub connection: %w", err)
++		}
++	}
++	if _, err := services.GitHub.UpdateWorkspaceSettings(ctx, &github.UpdateWorkspaceSettingsRequest{
++		WorkspaceID: workspaceID, TaskGitCredentialsMode: &desired.TaskCredentialsMode,
++		RepoScopeMode: &desired.RepositoryScopeMode,
++	}); err != nil {
++		return fmt.Errorf("configure GitHub workspace: %w", err)
++	}
++	watches, err := services.GitHub.ListIssueWatches(ctx, workspaceID)
++	if err != nil {
++		return fmt.Errorf("list obsolete GitHub issue watches: %w", err)
++	}
++	for _, watch := range watches {
++		if err := services.GitHub.DeleteIssueWatch(ctx, watch.ID); err != nil {
++			return fmt.Errorf("delete obsolete GitHub issue watch %q: %w", watch.ID, err)
++		}
++	}
++	return nil
++}
++
++func readManagedSecret(path string) (string, error) {
++	value, err := os.ReadFile(path)
++	if err != nil {
++		return "", fmt.Errorf("read managed secret %q: %w", path, err)
++	}
++	trimmed := strings.TrimSpace(string(value))
++	if trimmed == "" {
++		return "", fmt.Errorf("managed secret file %q is empty", path)
++	}
++	return trimmed, nil
++}
++
++func managedAgentEnvironment(values []config.ManagedEnvironment, secretIDs map[string]string) ([]agentsettingsdto.ProfileEnvVarDTO, error) {
++	result := make([]agentsettingsdto.ProfileEnvVarDTO, len(values))
++	for index, value := range values {
++		secretID, err := resolveManagedSecret(value.Secret, secretIDs)
++		if err != nil {
++			return nil, err
++		}
++		result[index] = agentsettingsdto.ProfileEnvVarDTO{Key: value.Key, Value: value.Value, SecretID: secretID}
++	}
++	return result, nil
++}
++
++func managedExecutorEnvironment(values []config.ManagedEnvironment, secretIDs map[string]string) ([]taskmodels.ProfileEnvVar, error) {
++	result := make([]taskmodels.ProfileEnvVar, len(values))
++	for index, value := range values {
++		secretID, err := resolveManagedSecret(value.Secret, secretIDs)
++		if err != nil {
++			return nil, err
++		}
++		result[index] = taskmodels.ProfileEnvVar{Key: value.Key, Value: value.Value, SecretID: secretID}
++	}
++	return result, nil
++}
++
++func resolveManagedSecret(name string, secretIDs map[string]string) (string, error) {
++	if name == "" {
++		return "", nil
++	}
++	id, ok := secretIDs[name]
++	if !ok {
++		return "", fmt.Errorf("secret %q is not managed", name)
++	}
++	return id, nil
++}
++
++func parseSSHHostPublicKey(publicKey string) (string, string, error) {
++	key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(publicKey))
++	if err != nil {
++		return "", "", fmt.Errorf("SSH host public key is malformed: %w", err)
++	}
++	return key.Type(), ssh.FingerprintSHA256(key), nil
++}
++
++func decodeManagedStepEvents(value map[string]any) (workflowmodels.StepEvents, error) {
++	encoded, err := json.Marshal(value)
++	if err != nil {
++		return workflowmodels.StepEvents{}, err
++	}
++	var events workflowmodels.StepEvents
++	if err := json.Unmarshal(encoded, &events); err != nil {
++		return workflowmodels.StepEvents{}, err
++	}
++	return events, nil
++}
++
++func cloneStringMap(source map[string]string) map[string]string {
++	result := make(map[string]string, len(source)+1)
++	for key, value := range source {
++		result[key] = value
++	}
++	return result
++}
+diff --git a/apps/backend/internal/common/config/config.go b/apps/backend/internal/common/config/config.go
+index c44f3bdd..df941389 100644
+--- a/apps/backend/internal/common/config/config.go
++++ b/apps/backend/internal/common/config/config.go
+@@ -53,6 +53,7 @@ type Config struct {
+ 	Office                 OfficeConfig                 `mapstructure:"office"`
+ 	Features               FeaturesConfig               `mapstructure:"features"`
+ 	GitHubCredentialBroker GitHubCredentialBrokerConfig `mapstructure:"githubCredentialBroker"`
++	Managed                ManagedConfig                `mapstructure:"managed"`
+ 	Source                 ConfigSource                 `mapstructure:"-" json:"-"`
+ }
+ 
+diff --git a/apps/backend/internal/common/config/managed.go b/apps/backend/internal/common/config/managed.go
+new file mode 100644
+index 00000000..0e073f5f
+--- /dev/null
++++ b/apps/backend/internal/common/config/managed.go
+@@ -0,0 +1,97 @@
++package config
++
++type ManagedConfig struct {
++	Plugins    []ManagedPlugin    `mapstructure:"plugins"`
++	Secrets    []ManagedSecret    `mapstructure:"secrets"`
++	Agents     []ManagedAgent     `mapstructure:"agents"`
++	Executors  []ManagedExecutor  `mapstructure:"executors"`
++	Workspaces []ManagedWorkspace `mapstructure:"workspaces"`
++}
++
++type ManagedPlugin struct {
++	ID          string `mapstructure:"id"`
++	Version     string `mapstructure:"version"`
++	PackageFile string `mapstructure:"packageFile"`
++}
++
++type ManagedSecret struct {
++	Name      string `mapstructure:"name"`
++	ValueFile string `mapstructure:"valueFile"`
++}
++
++type ManagedAgent struct {
++	Name     string                `mapstructure:"name"`
++	Profiles []ManagedAgentProfile `mapstructure:"profiles"`
++}
++
++type ManagedAgentProfile struct {
++	Name           string               `mapstructure:"name"`
++	Model          string               `mapstructure:"model"`
++	FallbackModel  string               `mapstructure:"fallbackModel"`
++	AutoFallback   bool                 `mapstructure:"autoFallback"`
++	AllowIndexing  bool                 `mapstructure:"allowIndexing"`
++	AutoApprove    bool                 `mapstructure:"autoApprove"`
++	CLIPassthrough bool                 `mapstructure:"cliPassthrough"`
++	Enabled        bool                 `mapstructure:"enabled"`
++	Environment    []ManagedEnvironment `mapstructure:"environment"`
++	Instructions   *string              `mapstructure:"instructions"`
++}
++
++type ManagedEnvironment struct {
++	Key    string `mapstructure:"key"`
++	Value  string `mapstructure:"value"`
++	Secret string `mapstructure:"secret"`
++}
++
++type ManagedExecutor struct {
++	Name             string                   `mapstructure:"name"`
++	Type             string                   `mapstructure:"type"`
++	Status           string                   `mapstructure:"status"`
++	Resumable        bool                     `mapstructure:"resumable"`
++	Config           map[string]string        `mapstructure:"config"`
++	SSHHostPublicKey string                   `mapstructure:"sshHostPublicKey"`
++	Profiles         []ManagedExecutorProfile `mapstructure:"profiles"`
++}
++
++type ManagedExecutorProfile struct {
++	Name          string               `mapstructure:"name"`
++	MCPPolicy     string               `mapstructure:"mcpPolicy"`
++	Config        map[string]string    `mapstructure:"config"`
++	PrepareScript string               `mapstructure:"prepareScript"`
++	CleanupScript string               `mapstructure:"cleanupScript"`
++	Environment   []ManagedEnvironment `mapstructure:"environment"`
++}
++
++type ManagedWorkspace struct {
++	Name                string            `mapstructure:"name"`
++	DefaultAgentProfile string            `mapstructure:"defaultAgentProfile"`
++	BranchPrefix        string            `mapstructure:"branchPrefix"`
++	BranchTemplate      string            `mapstructure:"branchTemplate"`
++	Workflows           []ManagedWorkflow `mapstructure:"workflows"`
++	GitHub              *ManagedGitHub    `mapstructure:"github"`
++}
++
++type ManagedWorkflow struct {
++	Name         string                `mapstructure:"name"`
++	Description  string                `mapstructure:"description"`
++	Prompt       string                `mapstructure:"prompt"`
++	AgentProfile string                `mapstructure:"agentProfile"`
++	Steps        []ManagedWorkflowStep `mapstructure:"steps"`
++}
++
++type ManagedWorkflowStep struct {
++	Name               string         `mapstructure:"name"`
++	Color              string         `mapstructure:"color"`
++	StageType          string         `mapstructure:"stageType"`
++	Prompt             string         `mapstructure:"prompt"`
++	Events             map[string]any `mapstructure:"events"`
++	AllowManualMove    bool           `mapstructure:"allowManualMove"`
++	IsStartStep        bool           `mapstructure:"isStartStep"`
++	ShowInCommandPanel bool           `mapstructure:"showInCommandPanel"`
++}
++
++type ManagedGitHub struct {
++	TokenFile           string `mapstructure:"tokenFile"`
++	TaskCredentialsMode string `mapstructure:"taskCredentialsMode"`
++	RepositoryScopeMode string `mapstructure:"repositoryScopeMode"`
++}
+diff --git a/apps/backend/internal/common/config/managed_test.go b/apps/backend/internal/common/config/managed_test.go
+new file mode 100644
+index 00000000..3281a656
+--- /dev/null
++++ b/apps/backend/internal/common/config/managed_test.go
+@@ -0,0 +1,60 @@
++package config
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestManagedConfigFromFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "config.yaml")
++	contents := `{
++		"managed": {
++			"plugins": [{"id": "resource-coordinator", "version": "0.2.0", "packageFile": "/package.tar.gz"}],
++			"agents": [{"name": "codex-acp", "profiles": [
++				{"name": "managed", "instructions": ""},
++				{"name": "unmanaged"}
++			]}],
++			"executors": [{
++				"name": "executor-1",
++				"type": "ssh",
++				"sshHostPublicKey": "ssh-ed25519 AAAA",
++				"profiles": [{"name": "executor-1", "prepareScript": "default"}]
++			}],
++			"workspaces": [{
++				"name": "Default Workspace",
++				"github": {
++					"taskCredentialsMode": "executor",
++					"repositoryScopeMode": "all"
++				}
++			}]
++		}
++	}`
++	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	cfg, err := LoadWithPath(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(cfg.Managed.Plugins) != 1 || cfg.Managed.Plugins[0].PackageFile != "/package.tar.gz" {
++		t.Fatalf("managed plugins = %#v", cfg.Managed.Plugins)
++	}
++	profiles := cfg.Managed.Agents[0].Profiles
++	if profiles[0].Instructions == nil || *profiles[0].Instructions != "" {
++		t.Fatalf("explicit empty instructions = %#v", profiles[0].Instructions)
++	}
++	if profiles[1].Instructions != nil {
++		t.Fatalf("absent instructions = %#v", profiles[1].Instructions)
++	}
++	if len(cfg.Managed.Executors) != 1 || len(cfg.Managed.Executors[0].Profiles) != 1 || cfg.Managed.Executors[0].Profiles[0].PrepareScript != "default" {
++		t.Fatalf("managed executors = %#v", cfg.Managed.Executors)
++	}
++	if len(cfg.Managed.Workspaces) != 1 {
++		t.Fatalf("managed workspaces = %#v", cfg.Managed.Workspaces)
++	}
++	github := cfg.Managed.Workspaces[0].GitHub
++	if github == nil || github.TaskCredentialsMode != "executor" || github.RepositoryScopeMode != "all" {
++		t.Fatalf("managed GitHub configuration = %#v", github)
++	}
++}
+diff --git a/apps/backend/internal/task/service/service.go b/apps/backend/internal/task/service/service.go
+index 83b3ebca..e1841c2f 100644
+--- a/apps/backend/internal/task/service/service.go
++++ b/apps/backend/internal/task/service/service.go
+@@ -106,6 +106,11 @@ type TaskResourceCleanupActivityLease interface {
+ 	Release()
+ }
+ 
++type repositoryBranchDefaults struct {
++	prefix   string
++	template string
++}
++
+ // ProviderDefaultBranchProber resolves a provider repo's default branch
+ // (e.g. "main" / "master") without requiring a local clone. Used by
+ // AddBranchToTask to satisfy the worktree-create precondition synchronously,
+@@ -406,7 +411,9 @@ type Service struct {
+ 	// instead of each inserting a duplicate. Covers concurrent requests
+ 	// within this backend process only — this backend is single-process per
+ 	// SQLite database, so that is the complete threat model today.
+-	repoResolveMu sync.Mutex
++	repoResolveMu              sync.Mutex
++	repositoryBranchDefaultsMu sync.RWMutex
++	repositoryBranchDefaults   map[string]repositoryBranchDefaults
+ 	// pendingActionProjectionMu guards the durable-generation logical clock
+ 	// shared by REST snapshots and semantic message events. Revisions are
+ 	// reserved before each repository read so delayed results stay ordered.
+@@ -450,41 +457,64 @@ func (s *Service) SetWorkspaceSecretDeleter(deleter WorkspaceSecretDeleter) {
+ // NewService creates a new task service
+ func NewService(repos Repos, eventBus bus.EventBus, log *logger.Logger, discoveryConfig RepositoryDiscoveryConfig) *Service {
+ 	return &Service{
+-		workspaces:            repos.Workspaces,
+-		tasks:                 repos.Tasks,
+-		taskRepos:             repos.TaskRepos,
+-		workspaceFolders:      repos.WorkspaceFolders,
+-		workflows:             repos.Workflows,
+-		messages:              repos.Messages,
+-		attachments:           repos.Attachments,
+-		turns:                 repos.Turns,
+-		sessions:              repos.Sessions,
+-		gitSnapshots:          repos.GitSnapshots,
+-		repoEntities:          repos.RepoEntities,
+-		repositorySets:        repos.RepositorySets,
+-		branchPolicies:        repos.BranchPolicies,
+-		repositoryCleanup:     repos.RepositoryCleanup,
+-		executors:             repos.Executors,
+-		environments:          repos.Environments,
+-		taskEnvironments:      repos.TaskEnvironments,
+-		reviews:               repos.Reviews,
+-		resourceCleanups:      repos.ResourceCleanups,
+-		statusSummaries:       repos.StatusSummaries,
+-		taskActivity:          repos.TaskActivity,
+-		subagentContexts:      repos.SubagentContexts,
+-		usage:                 repos.Usage,
+-		eventBus:              eventBus,
+-		logger:                log,
+-		discoveryConfig:       discoveryConfig,
+-		branchFetcher:         newBranchFetcher(log.Zap()),
+-		lastTaskActivity:      make(map[string]v1.ForegroundActivity),
+-		lastTaskSubagentCount: make(map[string]int),
++		workspaces:               repos.Workspaces,
++		tasks:                    repos.Tasks,
++		taskRepos:                repos.TaskRepos,
++		workspaceFolders:         repos.WorkspaceFolders,
++		workflows:                repos.Workflows,
++		messages:                 repos.Messages,
++		attachments:              repos.Attachments,
++		turns:                    repos.Turns,
++		sessions:                 repos.Sessions,
++		gitSnapshots:             repos.GitSnapshots,
++		repoEntities:             repos.RepoEntities,
++		repositorySets:           repos.RepositorySets,
++		branchPolicies:           repos.BranchPolicies,
++		repositoryCleanup:        repos.RepositoryCleanup,
++		executors:                repos.Executors,
++		environments:             repos.Environments,
++		taskEnvironments:         repos.TaskEnvironments,
++		reviews:                  repos.Reviews,
++		resourceCleanups:         repos.ResourceCleanups,
++		statusSummaries:          repos.StatusSummaries,
++		taskActivity:             repos.TaskActivity,
++		subagentContexts:         repos.SubagentContexts,
++		usage:                    repos.Usage,
++		eventBus:                 eventBus,
++		logger:                   log,
++		discoveryConfig:          discoveryConfig,
++		branchFetcher:            newBranchFetcher(log.Zap()),
++		lastTaskActivity:         make(map[string]v1.ForegroundActivity),
++		lastTaskSubagentCount:    make(map[string]int),
++		repositoryBranchDefaults: make(map[string]repositoryBranchDefaults),
+ 		// Focused service tests do not run backend composition. Production
+ 		// replaces this fallback with a database-allocated generation.
+ 		pendingActionProjectionEpoch: "1",
+ 	}
+ }
+ 
++func (s *Service) SetRepositoryBranchDefaults(workspaceID, prefix, template string) error {
++	prefix = strings.TrimSpace(prefix)
++	if err := worktree.ValidateBranchPrefix(prefix); err != nil {
++		return fmt.Errorf("invalid repository branch prefix: %w", err)
++	}
++	template = worktree.NormalizeBranchNameTemplate(template)
++	if err := worktree.ValidateBranchNameTemplate(template); err != nil {
++		return fmt.Errorf("invalid repository branch template: %w", err)
++	}
++	s.repositoryBranchDefaultsMu.Lock()
++	s.repositoryBranchDefaults[workspaceID] = repositoryBranchDefaults{prefix: prefix, template: template}
++	s.repositoryBranchDefaultsMu.Unlock()
++	return nil
++}
++
++func (s *Service) repositoryBranchDefaultsFor(workspaceID string) (repositoryBranchDefaults, bool) {
++	s.repositoryBranchDefaultsMu.RLock()
++	defaults, ok := s.repositoryBranchDefaults[workspaceID]
++	s.repositoryBranchDefaultsMu.RUnlock()
++	return defaults, ok
++}
++
+ // SetWorktreeCleanup sets the worktree cleanup handler for task deletion.
+ func (s *Service) SetWorktreeCleanup(cleanup WorktreeCleanup) {
+ 	s.worktreeCleanup = cleanup
+diff --git a/apps/backend/internal/task/service/service_resources.go b/apps/backend/internal/task/service/service_resources.go
+index a237a031..48e3e6ad 100644
+--- a/apps/backend/internal/task/service/service_resources.go
++++ b/apps/backend/internal/task/service/service_resources.go
+@@ -765,13 +765,18 @@ func (s *Service) createRepository(
+ 		return nil, fmt.Errorf("%w: invalid default branch", ErrInvalidRepositorySettings)
+ 	}
+ 	prefix := strings.TrimSpace(req.WorktreeBranchPrefix)
++	template := req.WorktreeBranchTemplate
++	if defaults, ok := s.repositoryBranchDefaultsFor(req.WorkspaceID); ok {
++		prefix = defaults.prefix
++		template = defaults.template
++	}
+ 	if err := worktree.ValidateBranchPrefix(prefix); err != nil {
+ 		return nil, fmt.Errorf("%w: %s", ErrInvalidRepositorySettings, err)
+ 	}
+ 	if prefix == "" {
+ 		prefix = worktree.DefaultBranchPrefix
+ 	}
+-	template := worktree.NormalizeBranchNameTemplate(req.WorktreeBranchTemplate)
++	template = worktree.NormalizeBranchNameTemplate(template)
+ 	if err := worktree.ValidateBranchNameTemplate(template); err != nil {
+ 		return nil, fmt.Errorf("%w: %s", ErrInvalidRepositorySettings, err)
+ 	}
+diff --git a/apps/backend/internal/agentctl/server/utility/acp_executor.go b/apps/backend/internal/agentctl/server/utility/acp_executor.go
+index 7c898044..3f198e36 100644
+--- a/apps/backend/internal/agentctl/server/utility/acp_executor.go
++++ b/apps/backend/internal/agentctl/server/utility/acp_executor.go
+@@ -1184,6 +1184,7 @@ func derefString(p *string) string {
+ // semantically the same as the base name taken from InferenceConfig.Command.
+ var allowedProbeCommands = map[string]string{
+ 	"auggie":        "auggie",
++	"codex-acp":     "codex-acp",
+ 	"cursor-agent":  "cursor-agent",
+ 	"devin":         "devin",
+ 	"grok":          "grok",
+diff --git a/apps/backend/internal/agent/agents/codex_acp.go b/apps/backend/internal/agent/agents/codex_acp.go
+index d1420d6a..ea15044b 100644
+--- a/apps/backend/internal/agent/agents/codex_acp.go
++++ b/apps/backend/internal/agent/agents/codex_acp.go
+@@ -16,18 +16,14 @@ var codexACPLogoLight []byte
+ //go:embed logos/codex_dark.svg
+ var codexACPLogoDark []byte
+ 
+-const codexACPPackage = "@agentclientprotocol/codex-acp"
++const codexACPBinary = "codex-acp"
+ 
+ var (
+-	_ Agent                  = (*CodexACP)(nil)
+-	_ PassthroughAgent       = (*CodexACP)(nil)
+-	_ InferenceAgent         = (*CodexACP)(nil)
+-	_ ManagedNPMRuntimeAgent = (*CodexACP)(nil)
++	_ Agent            = (*CodexACP)(nil)
++	_ PassthroughAgent = (*CodexACP)(nil)
++	_ InferenceAgent   = (*CodexACP)(nil)
+ )
+ 
+-// CodexACP implements Agent for the Agent Client Protocol codex-acp package.
+-// It speaks the ACP protocol (JSON-RPC 2.0 over stdin/stdout) through the npm
+-// bridge for OpenAI Codex. Used for A/B comparison against the native Codex agent.
+ type CodexACP struct {
+ 	StandardPassthrough
+ }
+@@ -56,7 +52,7 @@ func NewCodexACP() *CodexACP {
+ 				Supported:        true,
+ 				Label:            "CLI Passthrough",
+ 				Description:      "Show terminal directly instead of chat interface",
+-				PassthroughCmd:   NewCommand("npx", "-y", "@openai/codex"),
++				PassthroughCmd:   NewCommand("codex"),
+ 				ModelFlag:        NewParam("--model", "{model}"),
+ 				IdleTimeout:      3 * time.Second,
+ 				BufferMaxBytes:   DefaultBufferMaxBytes,
+@@ -87,7 +83,7 @@ func (a *CodexACP) Logo(v LogoVariant) []byte {
+ func (a *CodexACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+ 	// Check for the CLI binary on PATH. Auth state is surfaced later by the
+ 	// ACP probe (session/new returns auth_required if the user hasn't logged in).
+-	result, err := Detect(ctx, WithCommand("codex-acp"), WithCommand("codex"))
++	result, err := Detect(ctx, WithCommand(codexACPBinary), WithCommand("codex"))
+ 	if err != nil {
+ 		return result, err
+ 	}
+@@ -95,12 +91,8 @@ func (a *CodexACP) IsInstalled(ctx context.Context) (*DiscoveryResult, error) {
+ 	return result, nil
+ }
+ 
+-func (a *CodexACP) BuildCommand(opts CommandOptions) Command {
+-	return a.ManagedNPMRuntime().ACPCommand(opts.ManagedRuntimeVersion)
+-}
+-
+-func (a *CodexACP) ManagedNPMRuntime() ManagedNPMRuntimeSpec {
+-	return newManagedNPMRuntimeSpec(codexACPPackage)
++func (a *CodexACP) BuildCommand(_ CommandOptions) Command {
++	return NewCommand(codexACPBinary)
+ }
+ 
+ func (a *CodexACP) Runtime() *RuntimeConfig {
+@@ -108,7 +100,7 @@ func (a *CodexACP) Runtime() *RuntimeConfig {
+ 	return &RuntimeConfig{
+ 		Image:       "kandev/multi-agent",
+ 		Tag:         "latest",
+-		Cmd:         a.ManagedNPMRuntime().CachedACPCommand(),
++		Cmd:         NewCommand(codexACPBinary),
+ 		WorkingDir:  "{workspace}",
+ 		RequiredEnv: []string{"OPENAI_API_KEY"},
+ 		Env:         map[string]string{},
+@@ -180,10 +172,8 @@ func (a *CodexACP) LoginCommand() *LoginCommand {
+ 	}
+ }
+ 
+-// Install both the user-facing OpenAI codex CLI (which `codex login` runs
+-// against) and the ACP bridge package used for chat sessions.
+ func (a *CodexACP) InstallScript() string {
+-	return "npm install -g @openai/codex " + codexACPPackage
++	return ""
+ }
+ 
+ func (a *CodexACP) BillingType() usage.BillingType { return codexBillingType() }
+@@ -196,6 +186,6 @@ func (a *CodexACP) PermissionSettings() map[string]PermissionSetting {
+ func (a *CodexACP) InferenceConfig() *InferenceConfig {
+ 	return &InferenceConfig{
+ 		Supported: true,
+-		Command:   a.ManagedNPMRuntime().CachedACPCommand(),
++		Command:   NewCommand(codexACPBinary),
+ 	}
+ }
+diff --git a/apps/backend/internal/agent/agents/codex_acp_test.go b/apps/backend/internal/agent/agents/codex_acp_test.go
+index 8be30ea5..15618d15 100644
+--- a/apps/backend/internal/agent/agents/codex_acp_test.go
++++ b/apps/backend/internal/agent/agents/codex_acp_test.go
+@@ -26,7 +26,7 @@ func TestCodexACP_PermissionSettings_NoBridgeCLIFlags(t *testing.T) {
+ 
+ func TestCodexACP_BuildCommand_NoCodexCLIFlags(t *testing.T) {
+ 	agent := NewCodexACP()
+-	want := agent.ManagedNPMRuntime().CachedACPCommand().Args()
++	want := []string{"codex-acp"}
+ 	cmd := agent.BuildCommand(CommandOptions{
+ 		PermissionValues: map[string]bool{PermissionKeyAutoApprove: true},
+ 	})
+@@ -35,9 +35,9 @@ func TestCodexACP_BuildCommand_NoCodexCLIFlags(t *testing.T) {
+ 	}
+ }
+ 
+-func TestCodexACP_UsesAgentClientProtocolBridge(t *testing.T) {
++func TestCodexACPUsesNixManagedExecutables(t *testing.T) {
+ 	a := NewCodexACP()
+-	want := a.ManagedNPMRuntime().CachedACPCommand().Args()
++	want := []string{"codex-acp"}
+ 
+ 	if got := a.BuildCommand(CommandOptions{}).Args(); !slices.Equal(got, want) {
+ 		t.Fatalf("BuildCommand = %#v, want %#v", got, want)
+@@ -48,9 +48,14 @@ func TestCodexACP_UsesAgentClientProtocolBridge(t *testing.T) {
+ 	if got := a.InferenceConfig().Command.Args(); !slices.Equal(got, want) {
+ 		t.Fatalf("Inference Command = %#v, want %#v", got, want)
+ 	}
+-	wantInstall := "npm install -g @openai/codex @agentclientprotocol/codex-acp"
+-	if got := a.InstallScript(); got != wantInstall {
+-		t.Fatalf("InstallScript = %q, want %q", got, wantInstall)
++	if got := a.PassthroughConfig().PassthroughCmd.Args(); !slices.Equal(got, []string{"codex"}) {
++		t.Fatalf("Passthrough Command = %#v, want %#v", got, []string{"codex"})
++	}
++	if _, ok := any(a).(ManagedNPMRuntimeAgent); ok {
++		t.Fatal("Codex ACP unexpectedly exposes an npm-managed runtime")
++	}
++	if got := a.InstallScript(); got != "" {
++		t.Fatalf("InstallScript = %q, want empty", got)
+ 	}
+ }
+ 
+diff --git a/apps/backend/internal/agent/agents/managed_npm_runtime_test.go b/apps/backend/internal/agent/agents/managed_npm_runtime_test.go
+index cdfd35de..c7548cd9 100644
+--- a/apps/backend/internal/agent/agents/managed_npm_runtime_test.go
++++ b/apps/backend/internal/agent/agents/managed_npm_runtime_test.go
+@@ -15,7 +15,6 @@ func TestManagedNPMRuntimeContracts(t *testing.T) {
+ 		wantACPArgs []string
+ 	}{
+ 		{"claude", NewClaudeACP(), "@agentclientprotocol/claude-agent-acp", nil},
+-		{"codex", NewCodexACP(), "@agentclientprotocol/codex-acp", nil},
+ 		{"opencode", NewOpenCodeACP(), "opencode-ai", []string{"acp", "--print-logs", "--log-level", "ERROR"}},
+ 		{"copilot", NewCopilotACP(), "@github/copilot", []string{"--acp"}},
+ 		{"gemini", NewGemini(), "@google/gemini-cli", []string{"--acp"}},
+@@ -144,7 +143,6 @@ func TestManagedAgentsHonorExactVersionCommandOption(t *testing.T) {
+ 		agent ManagedNPMRuntimeAgent
+ 	}{
+ 		{"claude", NewClaudeACP()},
+-		{"codex", NewCodexACP()},
+ 		{"opencode", NewOpenCodeACP()},
+ 		{"copilot", NewCopilotACP()},
+ 		{"gemini", NewGemini()},
+diff --git a/apps/backend/internal/agent/agents/codex_acp_passthrough_test.go b/apps/backend/internal/agent/agents/codex_acp_passthrough_test.go
+index 52140335..96ad9e23 100644
+--- a/apps/backend/internal/agent/agents/codex_acp_passthrough_test.go
++++ b/apps/backend/internal/agent/agents/codex_acp_passthrough_test.go
+@@ -7,7 +7,7 @@ import (
+ 
+ func TestCodexACP_PassthroughCmd_NoRemovedFullAutoFlag(t *testing.T) {
+ 	pt := NewCodexACP().PassthroughConfig().PassthroughCmd.Args()
+-	want := []string{"npx", "-y", "@openai/codex"}
++	want := []string{"codex"}
+ 	if !slices.Equal(pt, want) {
+ 		t.Fatalf("PassthroughCmd = %#v, want %#v", pt, want)
+ 	}
+@@ -17,7 +17,7 @@ func TestCodexACP_BuildPassthroughCommand_AutoApprove(t *testing.T) {
+ 	cmd := NewCodexACP().BuildPassthroughCommand(PassthroughOptions{
+ 		PermissionValues: map[string]bool{"auto_approve": true},
+ 	})
+-	want := []string{"npx", "-y", "@openai/codex", "--ask-for-approval", "never"}
++	want := []string{"codex", "--ask-for-approval", "never"}
+ 	if !slices.Equal(cmd.Args(), want) {
+ 		t.Fatalf("argv = %#v, want %#v", cmd.Args(), want)
+ 	}
+@@ -27,7 +27,7 @@ func TestCodexACP_BuildPassthroughCommand_AutoApproveDisabled(t *testing.T) {
+ 	cmd := NewCodexACP().BuildPassthroughCommand(PassthroughOptions{
+ 		PermissionValues: map[string]bool{"auto_approve": false},
+ 	})
+-	want := []string{"npx", "-y", "@openai/codex"}
++	want := []string{"codex"}
+ 	if !slices.Equal(cmd.Args(), want) {
+ 		t.Fatalf("argv = %#v, want %#v", cmd.Args(), want)
+ 	}
+diff --git a/apps/backend/internal/agent/settings/controller/agent_update_status_test.go b/apps/backend/internal/agent/settings/controller/agent_update_status_test.go
+index 6fcf1473..8da4ef47 100644
+--- a/apps/backend/internal/agent/settings/controller/agent_update_status_test.go
++++ b/apps/backend/internal/agent/settings/controller/agent_update_status_test.go
+@@ -54,8 +54,6 @@ func TestListAgentUpdateStatusesComparesLatestAndCachesFailures(t *testing.T) {
+ 		switch packageName {
+ 		case "@agentclientprotocol/claude-agent-acp":
+ 			return "0.71.0", nil
+-		case "@agentclientprotocol/codex-acp":
+-			return agents.NewCodexACP().ManagedNPMRuntime().DefaultVersionOrPinned(), nil
+ 		case "@github/copilot":
+ 			return "1.0.74", nil
+ 		case "@google/gemini-cli":
+@@ -69,8 +67,8 @@ func TestListAgentUpdateStatusesComparesLatestAndCachesFailures(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("ListAgentUpdateStatuses: %v", err)
+ 	}
+-	if len(statuses.Statuses) != 4 {
+-		t.Fatalf("status count = %d, want 4", len(statuses.Statuses))
++	if len(statuses.Statuses) != 3 {
++		t.Fatalf("status count = %d, want 3", len(statuses.Statuses))
+ 	}
+ 	byPackage := make(map[string]dto.AgentUpdateStatusDTO, len(statuses.Statuses))
+ 	for _, status := range statuses.Statuses {
+@@ -85,8 +83,8 @@ func TestListAgentUpdateStatusesComparesLatestAndCachesFailures(t *testing.T) {
+ 	if got := byPackage["@agentclientprotocol/claude-agent-acp"].EffectiveVersion; got != "0.70.1" {
+ 		t.Fatalf("claude effective = %q, want selected version", got)
+ 	}
+-	if got := byPackage["@agentclientprotocol/codex-acp"].CheckState; got != dto.AgentUpdateCheckStateUpToDate {
+-		t.Fatalf("codex state = %q, want up_to_date", got)
++	if _, ok := byPackage["@agentclientprotocol/codex-acp"]; ok {
++		t.Fatal("Codex ACP unexpectedly has an npm runtime update status")
+ 	}
+ 	if got := byPackage["@github/copilot"].CheckState; got != dto.AgentUpdateCheckStateUpToDate {
+ 		t.Fatalf("copilot state = %q, want up_to_date for older latest", got)
+diff --git a/apps/backend/internal/agent/agents/managed_npm_runtime_versions.json b/apps/backend/internal/agent/agents/managed_npm_runtime_versions.json
+index 98b07417..a3d85947 100644
+--- a/apps/backend/internal/agent/agents/managed_npm_runtime_versions.json
++++ b/apps/backend/internal/agent/agents/managed_npm_runtime_versions.json
+@@ -1,6 +1,5 @@
+ {
+   "@agentclientprotocol/claude-agent-acp": "0.70.0",
+-  "@agentclientprotocol/codex-acp": "1.6.0",
+   "@github/copilot": "1.0.75",
+   "@google/gemini-cli": "0.52.0",
+   "opencode-ai": "1.18.18"
+diff --git a/apps/backend/internal/agent/agents/ACP_BRIDGE_VERSIONS.md b/apps/backend/internal/agent/agents/ACP_BRIDGE_VERSIONS.md
+index dd9b5715..09511616 100644
+--- a/apps/backend/internal/agent/agents/ACP_BRIDGE_VERSIONS.md
++++ b/apps/backend/internal/agent/agents/ACP_BRIDGE_VERSIONS.md
+@@ -9,7 +9,6 @@ it.
+ | Agent | Package | Default version | ACP arguments |
+ | --- | --- | --- | --- |
+ | Claude | `@agentclientprotocol/claude-agent-acp` | `0.70.0` | none |
+-| Codex | `@agentclientprotocol/codex-acp` | `1.6.0` | none |
+ | OpenCode | `opencode-ai` | `1.18.18` | `acp --print-logs --log-level ERROR` |
+ | Copilot | `@github/copilot` | `1.0.75` | `--acp` |
+ | Gemini | `@google/gemini-cli` | `0.52.0` | `--acp` |
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/executor_backend.go b/apps/backend/internal/agent/runtime/lifecycle/executor_backend.go
+index c489af5a..687907ad 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/executor_backend.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/executor_backend.go
+@@ -216,6 +216,7 @@ const (
+ 	MetadataKeySSHPort               = "ssh_port"
+ 	MetadataKeySSHUser               = "ssh_user"
+ 	MetadataKeySSHHostFingerprint    = "ssh_host_fingerprint"
++	MetadataKeySSHHostKeyAlgorithm   = "ssh_host_key_algorithm"
+ 	MetadataKeySSHRemoteTaskDir      = "ssh_remote_task_dir"
+ 	MetadataKeySSHRemoteSessionDir   = "ssh_remote_session_dir"
+ 	MetadataKeySSHRemoteAgentctlPort = "ssh_remote_agentctl_port"
+@@ -265,6 +266,7 @@ var persistentMetadataKeys = map[string]bool{
+ 	MetadataKeySSHPort:               true,
+ 	MetadataKeySSHUser:               true,
+ 	MetadataKeySSHHostFingerprint:    true,
++	MetadataKeySSHHostKeyAlgorithm:   true,
+ 	MetadataKeySSHRemoteTaskDir:      true,
+ 	MetadataKeySSHRemoteSessionDir:   true,
+ 	MetadataKeySSHRemoteAgentctlPort: true,
+@@ -354,16 +356,17 @@ func IsSessionScopedMetadataKey(key string) bool {
+ // login shell). Notably it includes ssh_host_alias so alias-only executors
+ // (host read from ~/.ssh/config) survive restore.
+ var sshWorkspaceFallbackKeys = map[string]bool{
+-	MetadataKeySSHHost:            true,
+-	MetadataKeySSHHostAlias:       true,
+-	MetadataKeySSHPort:            true,
+-	MetadataKeySSHUser:            true,
+-	MetadataKeySSHHostFingerprint: true,
+-	MetadataKeySSHIdentitySource:  true,
+-	MetadataKeySSHIdentityFile:    true,
+-	MetadataKeySSHProxyJump:       true,
+-	MetadataKeySSHWorkdirRoot:     true,
+-	MetadataKeySSHShell:           true,
++	MetadataKeySSHHost:             true,
++	MetadataKeySSHHostAlias:        true,
++	MetadataKeySSHPort:             true,
++	MetadataKeySSHUser:             true,
++	MetadataKeySSHHostFingerprint:  true,
++	MetadataKeySSHHostKeyAlgorithm: true,
++	MetadataKeySSHIdentitySource:   true,
++	MetadataKeySSHIdentityFile:     true,
++	MetadataKeySSHProxyJump:        true,
++	MetadataKeySSHWorkdirRoot:      true,
++	MetadataKeySSHShell:            true,
+ }
+ 
+ // FilterSSHWorkspaceFallbackConfig returns the subset of a stored SSH executor
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh.go b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh.go
+index 7da4ea25..db5b3a1d 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh.go
+@@ -168,6 +168,7 @@ func (r *SSHExecutor) targetFromMetadata(md map[string]interface{}) (*SSHTarget,
+ 		IdentityFile:      identityFile,
+ 		ProxyJump:         getMetadataString(md, MetadataKeySSHProxyJump),
+ 		PinnedFingerprint: getMetadataString(md, MetadataKeySSHHostFingerprint),
++		HostKeyAlgorithm:  getMetadataString(md, MetadataKeySSHHostKeyAlgorithm),
+ 	}
+ 	if cfg.PinnedFingerprint == "" {
+ 		return nil, errors.New("ssh executor: host_fingerprint is required — open the SSH executor connection settings, run Test connection, and trust the host")
+@@ -503,6 +504,7 @@ func (r *SSHExecutor) buildInstance(
+ 			MetadataKeySSHPort:               strconv.Itoa(target.Port),
+ 			MetadataKeySSHUser:               target.User,
+ 			MetadataKeySSHHostFingerprint:    target.PinnedFingerprint,
++			MetadataKeySSHHostKeyAlgorithm:   target.HostKeyAlgorithm,
+ 			MetadataKeySSHRemoteTaskDir:      taskDir,
+ 			MetadataKeySSHRemoteSessionDir:   sessionDir,
+ 			MetadataKeySSHRemoteAgentctlPort: strconv.Itoa(port),
+@@ -542,6 +544,7 @@ func (r *SSHExecutor) buildResumedInstance(req *ExecutorCreateRequest, state *ss
+ 			MetadataKeySSHPort:               strconv.Itoa(state.target.Port),
+ 			MetadataKeySSHUser:               state.target.User,
+ 			MetadataKeySSHHostFingerprint:    state.target.PinnedFingerprint,
++			MetadataKeySSHHostKeyAlgorithm:   state.target.HostKeyAlgorithm,
+ 			MetadataKeySSHRemoteTaskDir:      taskDir,
+ 			MetadataKeySSHRemoteSessionDir:   state.remoteDir,
+ 			MetadataKeySSHRemoteAgentctlPort: strconv.Itoa(port),
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_connection.go b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_connection.go
+index 39e52564..8fdc4df1 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_connection.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_connection.go
+@@ -32,14 +32,15 @@ const (
+ 
+ // SSHTarget is a resolved connection target after ~/.ssh/config inheritance.
+ type SSHTarget struct {
+-	Host           string            // resolved HostName
+-	Port           int               // resolved Port
+-	User           string            // resolved User
+-	IdentitySource SSHIdentitySource // agent | file
+-	IdentityFile   string            // path when IdentitySource=file
+-	IdentityAgent  string            // resolved agent socket override from ssh_config
+-	ProxyJump      string            // optional bastion (single hop)
+-	OriginalHost   string            // original alias/host, for OpenSSH %n/%k expansion
++	Host             string            // resolved HostName
++	Port             int               // resolved Port
++	User             string            // resolved User
++	IdentitySource   SSHIdentitySource // agent | file
++	IdentityFile     string            // path when IdentitySource=file
++	IdentityAgent    string            // resolved agent socket override from ssh_config
++	ProxyJump        string            // optional bastion (single hop)
++	OriginalHost     string            // original alias/host, for OpenSSH %n/%k expansion
++	HostKeyAlgorithm string
+ 
+ 	// PinnedFingerprint is the SHA256 fingerprint the user trusted in settings.
+ 	// Empty means "first connect / test mode" — accept any key and return what we saw.
+@@ -62,6 +63,7 @@ type SSHConnConfig struct {
+ 	IdentityFile      string
+ 	ProxyJump         string
+ 	PinnedFingerprint string
++	HostKeyAlgorithm  string
+ }
+ 
+ // ResolveSSHTarget merges form values with ~/.ssh/config Host blocks so a user
+@@ -80,6 +82,7 @@ func ResolveSSHTarget(cfg SSHConnConfig) (*SSHTarget, error) {
+ 		return nil, err
+ 	}
+ 	t.PinnedFingerprint = cfg.PinnedFingerprint
++	t.HostKeyAlgorithm = strings.TrimSpace(cfg.HostKeyAlgorithm)
+ 	return t, nil
+ }
+ 
+@@ -440,7 +443,7 @@ func buildClientConfig(target *SSHTarget) (*ssh.ClientConfig, func(), error) {
+ 	if err != nil {
+ 		return nil, authCleanup, err
+ 	}
+-	return &ssh.ClientConfig{
++	clientConfig := &ssh.ClientConfig{
+ 		User: target.User,
+ 		Auth: auth,
+ 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+@@ -455,7 +458,11 @@ func buildClientConfig(target *SSHTarget) (*ssh.ClientConfig, func(), error) {
+ 			return nil
+ 		},
+ 		Timeout: sshDialTimeout,
+-	}, authCleanup, nil
++	}
++	if target.HostKeyAlgorithm != "" {
++		clientConfig.HostKeyAlgorithms = []string{target.HostKeyAlgorithm}
++	}
++	return clientConfig, authCleanup, nil
+ }
+ 
+ // DialSSH opens an SSH connection to target, optionally via a bastion if
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_dial_test.go b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_dial_test.go
+index d5495410..0b48b9ba 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_dial_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/executor_ssh_dial_test.go
+@@ -339,13 +339,16 @@ func TestBuildClientConfigHostKeyCallback(t *testing.T) {
+ 	t.Run("a pinned fingerprint accepts a match", func(t *testing.T) {
+ 		target := &SSHTarget{
+ 			User: "deploy", IdentitySource: SSHIdentitySourceFile, IdentityFile: identity,
+-			PinnedFingerprint: fingerprint,
++			PinnedFingerprint: fingerprint, HostKeyAlgorithm: ssh.KeyAlgoED25519,
+ 		}
+ 		cfg, cleanup, err := buildClientConfig(target)
+ 		if err != nil {
+ 			t.Fatalf("buildClientConfig: %v", err)
+ 		}
+ 		defer cleanup()
++		if len(cfg.HostKeyAlgorithms) != 1 || cfg.HostKeyAlgorithms[0] != ssh.KeyAlgoED25519 {
++			t.Fatalf("HostKeyAlgorithms = %v", cfg.HostKeyAlgorithms)
++		}
+ 		if err := cfg.HostKeyCallback("host:22", nil, hostKey); err != nil {
+ 			t.Fatalf("matching host key must be accepted: %v", err)
+ 		}
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/manager_launch.go b/apps/backend/internal/agent/runtime/lifecycle/manager_launch.go
+index 21545888..97e036cb 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/manager_launch.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/manager_launch.go
+@@ -117,14 +117,15 @@ func applyRouteOverrideToProfile(profile *AgentProfileInfo, req *LaunchRequest)
+ // task override them would allow pivoting an SSH launch to a different host
+ // or bypassing the pinned host-key.
+ var trustedExecutorConfigKeys = map[string]bool{
+-	MetadataKeySSHHost:            true,
+-	MetadataKeySSHHostAlias:       true,
+-	MetadataKeySSHPort:            true,
+-	MetadataKeySSHUser:            true,
+-	MetadataKeySSHHostFingerprint: true,
+-	MetadataKeySSHIdentitySource:  true,
+-	MetadataKeySSHIdentityFile:    true,
+-	MetadataKeySSHProxyJump:       true,
++	MetadataKeySSHHost:             true,
++	MetadataKeySSHHostAlias:        true,
++	MetadataKeySSHPort:             true,
++	MetadataKeySSHUser:             true,
++	MetadataKeySSHHostFingerprint:  true,
++	MetadataKeySSHHostKeyAlgorithm: true,
++	MetadataKeySSHIdentitySource:   true,
++	MetadataKeySSHIdentityFile:     true,
++	MetadataKeySSHProxyJump:        true,
+ }
+ 
+ func isTrustedExecutorConfigKey(k string) bool { return trustedExecutorConfigKeys[k] }
+diff --git a/apps/backend/internal/agent/runtime/ssh_reclaim.go b/apps/backend/internal/agent/runtime/ssh_reclaim.go
+index 343ee1c5..2958ca63 100644
+--- a/apps/backend/internal/agent/runtime/ssh_reclaim.go
++++ b/apps/backend/internal/agent/runtime/ssh_reclaim.go
+@@ -13,16 +13,17 @@ import (
+ // SSHTaskDirReclaimRequest describes the recorded SSH connection and remote
+ // path for one terminal task cleanup attempt.
+ type SSHTaskDirReclaimRequest struct {
+-	Host            string
+-	Port            int
+-	User            string
+-	HostFingerprint string
+-	IdentitySource  string
+-	IdentityFile    string
+-	ProxyJump       string
+-	Shell           string
+-	WorkdirRoot     string
+-	TaskDir         string
++	Host             string
++	Port             int
++	User             string
++	HostFingerprint  string
++	HostKeyAlgorithm string
++	IdentitySource   string
++	IdentityFile     string
++	ProxyJump        string
++	Shell            string
++	WorkdirRoot      string
++	TaskDir          string
+ }
+ 
+ // SSHTaskDirReclaimResult reports whether the remote task directory was
+@@ -84,6 +85,7 @@ func (a *sshTaskDirReclaimer) ReclaimTaskDir(
+ 		IdentityFile:      req.IdentityFile,
+ 		ProxyJump:         req.ProxyJump,
+ 		PinnedFingerprint: req.HostFingerprint,
++		HostKeyAlgorithm:  req.HostKeyAlgorithm,
+ 	})
+ 	if err != nil {
+ 		return SSHTaskDirReclaimResult{}, fmt.Errorf("resolve ssh target %s: %w", req.Host, err)
+diff --git a/apps/backend/internal/backendapp/ssh_reclaim.go b/apps/backend/internal/backendapp/ssh_reclaim.go
+index aaa3fabd..784bc2f9 100644
+--- a/apps/backend/internal/backendapp/ssh_reclaim.go
++++ b/apps/backend/internal/backendapp/ssh_reclaim.go
+@@ -25,16 +25,17 @@ func (a *sshTaskDirReclaimerAdapter) ReclaimTaskDir(
+ 	req taskservice.SSHTaskDirReclaimRequest,
+ ) (taskservice.SSHTaskDirReclaimResult, error) {
+ 	result, err := a.reclaimer.ReclaimTaskDir(ctx, agentruntime.SSHTaskDirReclaimRequest{
+-		Host:            req.Host,
+-		Port:            req.Port,
+-		User:            req.User,
+-		HostFingerprint: req.HostFingerprint,
+-		IdentitySource:  req.IdentitySource,
+-		IdentityFile:    req.IdentityFile,
+-		ProxyJump:       req.ProxyJump,
+-		Shell:           req.Shell,
+-		WorkdirRoot:     req.WorkdirRoot,
+-		TaskDir:         req.TaskDir,
++		Host:             req.Host,
++		Port:             req.Port,
++		User:             req.User,
++		HostFingerprint:  req.HostFingerprint,
++		HostKeyAlgorithm: req.HostKeyAlgorithm,
++		IdentitySource:   req.IdentitySource,
++		IdentityFile:     req.IdentityFile,
++		ProxyJump:        req.ProxyJump,
++		Shell:            req.Shell,
++		WorkdirRoot:      req.WorkdirRoot,
++		TaskDir:          req.TaskDir,
+ 	})
+ 	if err != nil {
+ 		return taskservice.SSHTaskDirReclaimResult{}, err
+diff --git a/apps/backend/internal/ssh/handlers.go b/apps/backend/internal/ssh/handlers.go
+index ce9e5729..15b59a7c 100644
+--- a/apps/backend/internal/ssh/handlers.go
++++ b/apps/backend/internal/ssh/handlers.go
+@@ -452,6 +452,7 @@ func sshTargetFromExecutorConfig(cfg map[string]string) (*lifecycle.SSHTarget, e
+ 		IdentityFile:      cfg["ssh_identity_file"],
+ 		ProxyJump:         cfg["ssh_proxy_jump"],
+ 		PinnedFingerprint: cfg["ssh_host_fingerprint"],
++		HostKeyAlgorithm:  cfg["ssh_host_key_algorithm"],
+ 	})
+ }
+ 
+diff --git a/apps/backend/internal/task/service/resource_cleanup_ssh.go b/apps/backend/internal/task/service/resource_cleanup_ssh.go
+index 7bb6d3dc..1e2deb63 100644
+--- a/apps/backend/internal/task/service/resource_cleanup_ssh.go
++++ b/apps/backend/internal/task/service/resource_cleanup_ssh.go
+@@ -17,17 +17,18 @@ import (
+ // re-declared here as literals because the task service does not import the
+ // lifecycle package, the same way buildSSHLiveStatus already reads them.
+ const (
+-	sshMetaHost            = "ssh_host"
+-	sshMetaPort            = "ssh_port"
+-	sshMetaUser            = "ssh_user"
+-	sshMetaHostFingerprint = "ssh_host_fingerprint"
+-	sshMetaIdentitySource  = "ssh_identity_source"
+-	sshMetaIdentityFile    = "ssh_identity_file"
+-	sshMetaProxyJump       = "ssh_proxy_jump"
+-	sshMetaShell           = "ssh_shell"
+-	sshMetaWorkdirRoot     = "ssh_workdir_root"
+-	sshMetaRemoteTaskDir   = "ssh_remote_task_dir"
+-	sshMetaReclaimTaskDir  = "ssh_reclaim_task_dir"
++	sshMetaHost             = "ssh_host"
++	sshMetaPort             = "ssh_port"
++	sshMetaUser             = "ssh_user"
++	sshMetaHostFingerprint  = "ssh_host_fingerprint"
++	sshMetaHostKeyAlgorithm = "ssh_host_key_algorithm"
++	sshMetaIdentitySource   = "ssh_identity_source"
++	sshMetaIdentityFile     = "ssh_identity_file"
++	sshMetaProxyJump        = "ssh_proxy_jump"
++	sshMetaShell            = "ssh_shell"
++	sshMetaWorkdirRoot      = "ssh_workdir_root"
++	sshMetaRemoteTaskDir    = "ssh_remote_task_dir"
++	sshMetaReclaimTaskDir   = "ssh_reclaim_task_dir"
+ 
+ 	// sshReclaimEnabledValue is the only value that opts a profile in. It is
+ 	// compared, never displayed, and is written by the executor-profile
+@@ -51,16 +52,17 @@ const (
+ // mutated so the job stays self-contained across a backend restart, exactly
+ // like the session, worktree and environment records beside it.
+ type sshReclaimTarget struct {
+-	Host            string `json:"host"`
+-	Port            int    `json:"port,omitempty"`
+-	User            string `json:"user,omitempty"`
+-	HostFingerprint string `json:"host_fingerprint,omitempty"`
+-	IdentitySource  string `json:"identity_source,omitempty"`
+-	IdentityFile    string `json:"identity_file,omitempty"`
+-	ProxyJump       string `json:"proxy_jump,omitempty"`
+-	Shell           string `json:"shell,omitempty"`
+-	WorkdirRoot     string `json:"workdir_root"`
+-	TaskDir         string `json:"task_dir"`
++	Host             string `json:"host"`
++	Port             int    `json:"port,omitempty"`
++	User             string `json:"user,omitempty"`
++	HostFingerprint  string `json:"host_fingerprint,omitempty"`
++	HostKeyAlgorithm string `json:"host_key_algorithm,omitempty"`
++	IdentitySource   string `json:"identity_source,omitempty"`
++	IdentityFile     string `json:"identity_file,omitempty"`
++	ProxyJump        string `json:"proxy_jump,omitempty"`
++	Shell            string `json:"shell,omitempty"`
++	WorkdirRoot      string `json:"workdir_root"`
++	TaskDir          string `json:"task_dir"`
+ 	// Enabled records the profile's opt-in as it stood when the directory was
+ 	// launched. The profile is the sole source of truth; a task can never set
+ 	// it, because the executor projection treats the key as authoritative.
+@@ -95,16 +97,17 @@ func (t sshReclaimTarget) usable() bool {
+ // reclamation attempt. It deliberately mirrors the SSH connection tuple rather
+ // than importing the lifecycle types, keeping the dependency one-directional.
+ type SSHTaskDirReclaimRequest struct {
+-	Host            string
+-	Port            int
+-	User            string
+-	HostFingerprint string
+-	IdentitySource  string
+-	IdentityFile    string
+-	ProxyJump       string
+-	Shell           string
+-	WorkdirRoot     string
+-	TaskDir         string
++	Host             string
++	Port             int
++	User             string
++	HostFingerprint  string
++	HostKeyAlgorithm string
++	IdentitySource   string
++	IdentityFile     string
++	ProxyJump        string
++	Shell            string
++	WorkdirRoot      string
++	TaskDir          string
+ }
+ 
+ // SSHTaskDirReclaimResult reports what an attempt did. Removed and SkipReason
+@@ -181,17 +184,18 @@ func containsRemoteDir(targets []sshReclaimTarget, candidate sshReclaimTarget) b
+ // reclamation target. Pure function so the projection contract is unit-testable.
+ func sshReclaimTargetFromMetadata(md map[string]interface{}) sshReclaimTarget {
+ 	return sshReclaimTarget{
+-		Host:            strings.TrimSpace(mdString(md, sshMetaHost)),
+-		Port:            mdInt(md, sshMetaPort),
+-		User:            strings.TrimSpace(mdString(md, sshMetaUser)),
+-		HostFingerprint: strings.TrimSpace(mdString(md, sshMetaHostFingerprint)),
+-		IdentitySource:  strings.TrimSpace(mdString(md, sshMetaIdentitySource)),
+-		IdentityFile:    strings.TrimSpace(mdString(md, sshMetaIdentityFile)),
+-		ProxyJump:       strings.TrimSpace(mdString(md, sshMetaProxyJump)),
+-		Shell:           strings.TrimSpace(mdString(md, sshMetaShell)),
+-		WorkdirRoot:     strings.TrimSpace(mdString(md, sshMetaWorkdirRoot)),
+-		TaskDir:         strings.TrimSpace(mdString(md, sshMetaRemoteTaskDir)),
+-		Enabled:         strings.TrimSpace(mdString(md, sshMetaReclaimTaskDir)) == sshReclaimEnabledValue,
++		Host:             strings.TrimSpace(mdString(md, sshMetaHost)),
++		Port:             mdInt(md, sshMetaPort),
++		User:             strings.TrimSpace(mdString(md, sshMetaUser)),
++		HostFingerprint:  strings.TrimSpace(mdString(md, sshMetaHostFingerprint)),
++		HostKeyAlgorithm: strings.TrimSpace(mdString(md, sshMetaHostKeyAlgorithm)),
++		IdentitySource:   strings.TrimSpace(mdString(md, sshMetaIdentitySource)),
++		IdentityFile:     strings.TrimSpace(mdString(md, sshMetaIdentityFile)),
++		ProxyJump:        strings.TrimSpace(mdString(md, sshMetaProxyJump)),
++		Shell:            strings.TrimSpace(mdString(md, sshMetaShell)),
++		WorkdirRoot:      strings.TrimSpace(mdString(md, sshMetaWorkdirRoot)),
++		TaskDir:          strings.TrimSpace(mdString(md, sshMetaRemoteTaskDir)),
++		Enabled:          strings.TrimSpace(mdString(md, sshMetaReclaimTaskDir)) == sshReclaimEnabledValue,
+ 	}
+ }
+ 
+@@ -259,16 +263,17 @@ func (s *Service) reclaimSSHTaskDirs(
+ 
+ func (s *Service) reclaimOneSSHTaskDir(ctx context.Context, taskID string, target *sshReclaimTarget) error {
+ 	result, err := s.sshTaskDirReclaimer.ReclaimTaskDir(ctx, SSHTaskDirReclaimRequest{
+-		Host:            target.Host,
+-		Port:            target.Port,
+-		User:            target.User,
+-		HostFingerprint: target.HostFingerprint,
+-		IdentitySource:  target.IdentitySource,
+-		IdentityFile:    target.IdentityFile,
+-		ProxyJump:       target.ProxyJump,
+-		Shell:           target.Shell,
+-		WorkdirRoot:     target.WorkdirRoot,
+-		TaskDir:         target.TaskDir,
++		Host:             target.Host,
++		Port:             target.Port,
++		User:             target.User,
++		HostFingerprint:  target.HostFingerprint,
++		HostKeyAlgorithm: target.HostKeyAlgorithm,
++		IdentitySource:   target.IdentitySource,
++		IdentityFile:     target.IdentityFile,
++		ProxyJump:        target.ProxyJump,
++		Shell:            target.Shell,
++		WorkdirRoot:      target.WorkdirRoot,
++		TaskDir:          target.TaskDir,
+ 	})
+ 	if err != nil {
+ 		s.recordSSHReclaimOutcome(target, sshReclaimOutcomeFailed, "", err.Error())
+diff --git a/apps/backend/internal/backendapp/managed_config_test.go b/apps/backend/internal/backendapp/managed_config_test.go
+new file mode 100644
+index 00000000..75b083a5
+--- /dev/null
++++ b/apps/backend/internal/backendapp/managed_config_test.go
+@@ -0,0 +1,72 @@
++package backendapp
++
++import (
++	"context"
++	"testing"
++)
++
++type recordingManagedInstructionStore struct {
++	files map[string]map[string]string
++	calls int
++}
++
++func (s *recordingManagedInstructionStore) UpsertInstruction(
++	_ context.Context, profileID, filename, content string, isEntry bool,
++) error {
++	if filename != "AGENTS.md" || !isEntry {
++		panic("managed instructions must only upsert the entry AGENTS.md")
++	}
++	if s.files[profileID] == nil {
++		s.files[profileID] = make(map[string]string)
++	}
++	s.files[profileID][filename] = content
++	s.calls++
++	return nil
++}
++
++func TestReconcileManagedProfileInstructions(t *testing.T) {
++	ctx := context.Background()
++	store := &recordingManagedInstructionStore{files: map[string]map[string]string{
++		"codex":    {"AGENTS.md": "old", "HEARTBEAT.md": "keep"},
++		"opencode": {"AGENTS.md": "other"},
++	}}
++
++	managed := "new"
++	if err := reconcileManagedProfileInstructions(ctx, store, "new-profile", &managed); err != nil {
++		t.Fatal(err)
++	}
++	if got := store.files["new-profile"]["AGENTS.md"]; got != "new" {
++		t.Fatalf("new managed AGENTS.md = %q", got)
++	}
++	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &managed); err != nil {
++		t.Fatal(err)
++	}
++	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &managed); err != nil {
++		t.Fatal(err)
++	}
++	if got := store.files["codex"]["AGENTS.md"]; got != "new" {
++		t.Fatalf("managed AGENTS.md = %q", got)
++	}
++	if got := store.files["codex"]["HEARTBEAT.md"]; got != "keep" {
++		t.Fatalf("unmanaged sibling = %q", got)
++	}
++	if got := store.files["opencode"]["AGENTS.md"]; got != "other" {
++		t.Fatalf("other profile AGENTS.md = %q", got)
++	}
++
++	empty := ""
++	if err := reconcileManagedProfileInstructions(ctx, store, "codex", &empty); err != nil {
++		t.Fatal(err)
++	}
++	if got := store.files["codex"]["AGENTS.md"]; got != "" {
++		t.Fatalf("explicit empty AGENTS.md = %q", got)
++	}
++
++	calls := store.calls
++	if err := reconcileManagedProfileInstructions(ctx, store, "codex", nil); err != nil {
++		t.Fatal(err)
++	}
++	if store.calls != calls {
++		t.Fatal("absent instructions changed stored files")
++	}
++}

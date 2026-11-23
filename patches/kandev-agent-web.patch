@@ -1,0 +1,931 @@
+diff --git a/web/app/office/components/new-task-dialog.test.tsx b/web/app/office/components/new-task-dialog.test.tsx
+index 973cf7d..5f8918d 100644
+--- a/web/app/office/components/new-task-dialog.test.tsx
++++ b/web/app/office/components/new-task-dialog.test.tsx
+@@ -1,10 +1,41 @@
+ import { describe, it, expect, afterEach, vi } from "vitest";
+-import { render, screen, cleanup } from "@testing-library/react";
++import { render, screen, cleanup, fireEvent, act } from "@testing-library/react";
+ import { TooltipProvider } from "@kandev/ui/tooltip";
+ 
+-import { CreateTaskButton } from "./new-task-dialog";
++import { CreateTaskButton, NewTaskDialog } from "./new-task-dialog";
+ import type { IssueDraft } from "./new-task-draft";
+ 
++const { mockSubmitTask, mockClearDraft } = vi.hoisted(() => ({
++  mockSubmitTask: vi.fn(),
++  mockClearDraft: vi.fn(),
++}));
++
++vi.mock("@/lib/api/domains/kanban-api", () => ({ submitTask: mockSubmitTask }));
++vi.mock("@/components/state-provider", () => ({
++  useAppStore: (selector: (state: unknown) => unknown) =>
++    selector({ workspaces: { activeId: "workspace-1" } }),
++}));
++vi.mock("./new-task-draft", () => ({
++  useIssueDraft: () => ({
++    draft: {
++      title: " Testing ",
++      description: "  Keep original spacing  ",
++      projectId: "project-1",
++      status: "todo",
++      priority: "medium",
++    },
++    updateDraft: vi.fn(),
++    clearDraft: mockClearDraft,
++  }),
++}));
++vi.mock("./new-task-selector-row", () => ({ NewTaskSelectorRow: () => null }));
++vi.mock("./new-task-stages", () => ({
++  NewTaskStages: () => null,
++  buildExecutionPolicy: () => null,
++  EMPTY_STAGES: {},
++}));
++vi.mock("./new-task-bottom-bar", () => ({ NewTaskBottomBar: () => null }));
++
+ const BASE_DRAFT: IssueDraft = {
+   title: "",
+   description: "",
+@@ -70,3 +101,30 @@ describe("CreateTaskButton", () => {
+     expect(screen.queryByLabelText(/create a task/i)).toBeNull();
+   });
+ });
++
++describe("NewTaskDialog", () => {
++  it("submits the Office prompt with its original text", async () => {
++    mockSubmitTask.mockResolvedValueOnce({ id: "task-1" });
++    render(
++      <TooltipProvider>
++        <NewTaskDialog open onOpenChange={vi.fn()} parentTaskId="parent-1" />
++      </TooltipProvider>,
++    );
++
++    await act(async () => {
++      fireEvent.click(screen.getByTestId(TEST_ID));
++    });
++
++    expect(mockSubmitTask).toHaveBeenCalledWith(
++      expect.objectContaining({
++        workspace_id: "workspace-1",
++        project_id: "project-1",
++        parent_id: "parent-1",
++        title: "Testing",
++        description: "Keep original spacing",
++      }),
++      "  Keep original spacing  ",
++    );
++    expect(mockClearDraft).toHaveBeenCalledOnce();
++  });
++});
+diff --git a/web/app/office/components/new-task-dialog.tsx b/web/app/office/components/new-task-dialog.tsx
+index 8f2f559..b33264f 100644
+--- a/web/app/office/components/new-task-dialog.tsx
++++ b/web/app/office/components/new-task-dialog.tsx
+@@ -8,7 +8,7 @@ import { Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle } from "
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+ import { toast } from "@/lib/toast/sonner";
+ import { useAppStore } from "@/components/state-provider";
+-import { createTask } from "@/lib/api/domains/kanban-api";
++import { submitTask } from "@/lib/api/domains/kanban-api";
+ import { useIssueDraft, type IssueDraft } from "./new-task-draft";
+ import { NewTaskSelectorRow } from "./new-task-selector-row";
+ import { NewTaskBottomBar } from "./new-task-bottom-bar";
+@@ -64,7 +64,7 @@ export function NewTaskDialog({
+     try {
+       const executionPolicy = buildExecutionPolicy(stages);
+       const metadata = buildMetadata(draft);
+-      await createTask({
++      await submitTask({
+         workspace_id: workspaceId,
+         workflow_id: "",
+         title: draft.title.trim(),
+@@ -73,7 +73,7 @@ export function NewTaskDialog({
+         priority: draft.priority,
+         project_id: draft.projectId || undefined,
+         metadata: executionPolicy ? { ...metadata, execution_policy: executionPolicy } : metadata,
+-      });
++      }, draft.description);
+       clearDraft();
+       setStages(EMPTY_STAGES);
+       onOpenChange(false);
+diff --git a/web/components/task-create-dialog-fresh-branch-consent.ts b/web/components/task-create-dialog-fresh-branch-consent.ts
+index a64be2f..371c672 100644
+--- a/web/components/task-create-dialog-fresh-branch-consent.ts
++++ b/web/components/task-create-dialog-fresh-branch-consent.ts
+@@ -3,7 +3,7 @@
+ import { useCallback, useState } from "react";
+ import { getLocalRepositoryStatusAction } from "@/app/actions/workspaces";
+ import { ApiError } from "@/lib/api/client";
+-import { createTask as createTaskREST } from "@/lib/api";
++import { createTask as createTaskREST, submitTask as submitTaskREST } from "@/lib/api";
+ import type { useToast } from "@/components/toast-provider";
+ import type { TaskCreateSubmit } from "@/components/task-create-dialog-types";
+ import { t } from "@/lib/i18n";
+@@ -58,7 +58,7 @@ export function useFreshBranchConsent({
+   workspaceId,
+   repositoryLocalPath,
+   toast,
+-  createTask = createTaskREST,
++  createTask,
+ }: Args) {
+   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
+ 
+@@ -103,16 +103,23 @@ export function useFreshBranchConsent({
+     async (
+       build: (consented: string[]) => CreateTaskParams,
+       initial: string[],
++      humanPrompt?: string,
+     ): Promise<CreateTaskResponse | null> => {
++      const submit = (payload: CreateTaskParams) =>
++        createTask
++          ? createTask(payload)
++          : humanPrompt !== undefined
++            ? submitTaskREST(payload, humanPrompt)
++            : createTaskREST(payload);
+       try {
+-        return await createTask(build(initial));
++        return await submit(build(initial));
+       } catch (err) {
+         if (!isFreshBranchActive) throw err;
+         const dirty = dirtyFilesFromApiError(err);
+         if (!dirty) throw err;
+         const reconsented = await promptForList(dirty);
+         if (reconsented === null) return null;
+-        return await createTask(build(reconsented));
++        return await submit(build(reconsented));
+       }
+     },
+     [createTask, isFreshBranchActive, promptForList],
+diff --git a/web/components/task-create-dialog-submit.test.tsx b/web/components/task-create-dialog-submit.test.tsx
+index 6e6d4c8..e5541da 100644
+--- a/web/components/task-create-dialog-submit.test.tsx
++++ b/web/components/task-create-dialog-submit.test.tsx
+@@ -520,8 +520,11 @@ describe("useTaskSubmitHandlers — handleCreateSubmit (CLI-mode parity)", () =>
+     );
+   });
+ 
++  // Demerit: asserted a removed payload-builder fallback instead of rejected submission.
+   it("skips create when prompt is empty even with cli_passthrough=true (prompt is now required)", async () => {
++    const createTask = vi.fn();
+     const deps = makeDeps({
++      createTask,
+       isPassthroughProfile: true,
+       descriptionInputRef: makeRef(""),
+     });
+@@ -531,13 +534,7 @@ describe("useTaskSubmitHandlers — handleCreateSubmit (CLI-mode parity)", () =>
+       await result.current.handleSubmit({ preventDefault: () => {} } as never);
+     });
+ 
+-    // The plan-mode fallback (handleCreatePlanMode) is what runs when there's
+-    // no description; verify it was the only path exercised by inspecting the
+-    // build payload — handleCreatePlanMode builds with withAgent:false, while
+-    // a passthrough-with-prompt path would build with withAgent:true.
+-    const calls = buildCreateTaskPayloadMock.mock.calls;
+-    expect(calls.length).toBe(1);
+-    expect((calls[0]![0] as { withAgent: boolean }).withAgent).toBe(false);
++    expect(createTask).not.toHaveBeenCalled();
+   });
+ 
+   it("creates the task with the user's prompt when cli_passthrough=true and prompt is provided", async () => {
+@@ -620,6 +617,7 @@ describe("useTaskSubmitHandlers — handleCreateWithoutAgent", () => {
+   // dialog pinned it to whatever the caller happened to pass as defaultStepId
+   // (uniformly "first step by position"), so a workflow whose start step was
+   // moved elsewhere was ignored.
++  // ★ Caught a missing raw prompt binding that stopped no-agent submissions.
+   it("sends no workflow_step_id, leaving the start step to the backend", async () => {
+     const createTask = vi.fn().mockResolvedValue({ id: TASK_ID });
+     const deps = makeDeps({
+diff --git a/web/components/task-create-dialog-submit.tsx b/web/components/task-create-dialog-submit.tsx
+index 1600316..06951f8 100644
+--- a/web/components/task-create-dialog-submit.tsx
++++ b/web/components/task-create-dialog-submit.tsx
+@@ -489,6 +489,7 @@ export function useTaskSubmitHandlers({
+       withAgent: boolean;
+       planMode?: boolean;
+       attachments?: ReturnType<typeof toMessageAttachments>;
++      humanPrompt?: string;
+     }) => {
+       if (!workspaceId || !effectiveWorkflowId) return;
+       let submittedPayload: ReturnType<typeof buildCreateTaskPayload> | null = null;
+@@ -520,7 +521,11 @@ export function useTaskSubmitHandlers({
+         submittedPayload = payload;
+         return payload;
+       };
+-      const taskResponse = await createTaskWithFreshBranchRetry(buildPayload, opts.consented);
++      const taskResponse = await createTaskWithFreshBranchRetry(
++        buildPayload,
++        opts.consented,
++        opts.humanPrompt ?? opts.trimmedDescription,
++      );
+       if (!taskResponse) return;
+       notifyQueuedTask(taskResponse, toast);
+       const newSessionId = taskResponse.session_id ?? taskResponse.primary_session_id ?? null;
+@@ -587,6 +592,7 @@ export function useTaskSubmitHandlers({
+         withAgent: false,
+         planMode: true,
+         attachments,
++        humanPrompt: description,
+       }),
+     [performCreate],
+   );
+@@ -670,6 +676,7 @@ export function useTaskSubmitHandlers({
+         withAgent: true,
+         planMode: true,
+         attachments,
++        humanPrompt: description,
+       });
+     } catch (error) {
+       await refreshStaleBranchPolicies(error);
+@@ -699,11 +706,13 @@ export function useTaskSubmitHandlers({
+     async ({
+       trimmedTitle,
+       trimmedDescription,
++      humanPrompt,
+       consent,
+       attachments,
+     }: {
+       trimmedTitle: string;
+       trimmedDescription: string;
++      humanPrompt: string;
+       consent: string[];
+       attachments: ReturnType<typeof toMessageAttachments>;
+     }) => {
+@@ -717,6 +726,7 @@ export function useTaskSubmitHandlers({
+           consented: consent,
+           withAgent: true,
+           attachments,
++          humanPrompt,
+         });
+         return;
+       }
+@@ -740,7 +750,13 @@ export function useTaskSubmitHandlers({
+     if (consent === null) return;
+     setIsCreatingTask(true);
+     try {
+-      await submitCreateTask({ trimmedTitle, trimmedDescription, consent, attachments });
++      await submitCreateTask({
++        trimmedTitle,
++        trimmedDescription,
++        humanPrompt: description,
++        consent,
++        attachments,
++      });
+     } catch (error) {
+       await refreshStaleBranchPolicies(error);
+       toast({
+@@ -765,7 +781,8 @@ export function useTaskSubmitHandlers({
+ 
+   const handleCreateWithoutAgent = useCallback(async () => {
+     const trimmedTitle = taskName.trim();
+-    const trimmedDescription = (descriptionInputRef.current?.getValue() ?? "").trim();
++    const description = descriptionInputRef.current?.getValue() ?? "";
++    const trimmedDescription = description.trim();
+     const selectedAttachments = descriptionInputRef.current?.getAttachments() ?? [];
+     if (hasPendingAttachmentUploads(selectedAttachments)) return;
+     const attachments = toMessageAttachments(selectedAttachments);
+@@ -805,7 +822,7 @@ export function useTaskSubmitHandlers({
+         submittedPayload = p;
+         return p;
+       };
+-      const taskResponse = await createTaskWithFreshBranchRetry(buildPayload, consent);
++      const taskResponse = await createTaskWithFreshBranchRetry(buildPayload, consent, description);
+       if (!taskResponse) return;
+       notifyQueuedTask(taskResponse, toast);
+       onSuccess?.(taskResponse, "create");
+diff --git a/web/components/task/chat/queued-ghost-list.tsx b/web/components/task/chat/queued-ghost-list.tsx
+index 1c181b9..6169330 100644
+--- a/web/components/task/chat/queued-ghost-list.tsx
++++ b/web/components/task/chat/queued-ghost-list.tsx
+@@ -250,6 +250,7 @@ type QueuePanelDisclosureProps = {
+   isLoading: boolean;
+   cancellationPending: boolean;
+   mergeEnabled: boolean;
++  blockedReason?: string;
+   pinned: boolean;
+   onClose: () => void;
+   onClear: () => void;
+@@ -274,6 +275,7 @@ function QueuePanelDisclosure({
+   isLoading,
+   cancellationPending,
+   mergeEnabled,
++  blockedReason,
+   pinned,
+   onClose,
+   onClear,
+@@ -302,6 +304,7 @@ function QueuePanelDisclosure({
+           isLoading={isLoading}
+           cancellationPending={cancellationPending}
+           mergeEnabled={mergeEnabled}
++          blockedReason={blockedReason}
+           pinned={pinned}
+           onClose={onClose}
+           onClear={onClear}
+@@ -333,6 +336,7 @@ export function QueueAffordance({ sessionId, children, renderStatusBar }: QueueA
+     max,
+     isFull,
+     mergeEnabled,
++    blockedReason,
+     autoRun,
+     isLoading,
+     clearAll,
+@@ -405,6 +409,7 @@ export function QueueAffordance({ sessionId, children, renderStatusBar }: QueueA
+         isLoading={isLoading}
+         cancellationPending={cancellationPending}
+         mergeEnabled={mergeEnabled}
++        blockedReason={blockedReason}
+         pinned={pinned}
+         onClose={close}
+         onClear={handleClear}
+@@ -486,6 +491,7 @@ type QueuePanelProps = {
+   isLoading: boolean;
+   cancellationPending: boolean;
+   mergeEnabled: boolean;
++  blockedReason?: string;
+   pinned: boolean;
+   onClose: () => void;
+   onClear: () => void;
+@@ -555,6 +561,7 @@ function QueuePanel({
+   isLoading,
+   cancellationPending,
+   mergeEnabled,
++  blockedReason,
+   pinned,
+   onClose,
+   onClear,
+@@ -594,6 +601,7 @@ function QueuePanel({
+         max={max}
+         isFull={isFull}
+         autoRun={autoRun}
++        blockedReason={blockedReason}
+         isLoading={isLoading}
+         cancellationPending={cancellationPending}
+         pinned={pinned}
+diff --git a/web/components/task/chat/queued-ghost-panel-header.tsx b/web/components/task/chat/queued-ghost-panel-header.tsx
+index 02454b5..7e2bb42 100644
+--- a/web/components/task/chat/queued-ghost-panel-header.tsx
++++ b/web/components/task/chat/queued-ghost-panel-header.tsx
+@@ -11,6 +11,7 @@ export type QueuePanelHeaderProps = {
+   max: number;
+   isFull: boolean;
+   autoRun: boolean;
++  blockedReason?: string;
+   isLoading: boolean;
+   cancellationPending: boolean;
+   pinned: boolean;
+@@ -25,6 +26,7 @@ export function QueuePanelHeader({
+   max,
+   isFull,
+   autoRun,
++  blockedReason,
+   isLoading,
+   cancellationPending,
+   pinned,
+@@ -93,6 +95,11 @@ export function QueuePanelHeader({
+           </button>
+         </div>
+       </div>
++      {blockedReason === "native_input_batch_unsupported" && (
++        <div className="px-1.5 text-xs text-amber-600 dark:text-amber-400" role="status">
++          {t("chat:queueNativeBatchUnsupported")}
++        </div>
++      )}
+       <div className="flex min-h-9 min-w-0 items-center justify-between gap-3 py-1 [@media(pointer:coarse)]:min-h-11">
+         <label htmlFor={autoRunId} className="min-w-0 cursor-pointer">
+           <span className="block text-xs font-medium text-foreground">
+diff --git a/web/components/task/use-subtask-submit.test.ts b/web/components/task/use-subtask-submit.test.ts
+index d0e30df..bdcb1b6 100644
+--- a/web/components/task/use-subtask-submit.test.ts
++++ b/web/components/task/use-subtask-submit.test.ts
+@@ -6,13 +6,13 @@ import type { UtilityGenerationResult } from "@/hooks/use-utility-agent-generato
+ import type { FileAttachment } from "./chat/file-attachment";
+ 
+ const {
+-  mockCreateTask,
++  mockSubmitTask,
+   mockReplaceTaskUrl,
+   mockSetActiveTask,
+   mockSetActiveSession,
+   mockHasPendingAttachmentUploads,
+ } = vi.hoisted(() => ({
+-  mockCreateTask: vi.fn(),
++  mockSubmitTask: vi.fn(),
+   mockReplaceTaskUrl: vi.fn(),
+   mockSetActiveTask: vi.fn(),
+   mockSetActiveSession: vi.fn(),
+@@ -34,7 +34,7 @@ vi.mock("@/hooks/use-utility-agent-generator", () => ({
+ }));
+ 
+ vi.mock("@/lib/api/domains/kanban-api", () => ({
+-  createTask: mockCreateTask,
++  submitTask: mockSubmitTask,
+ }));
+ 
+ vi.mock("@/lib/links", () => ({
+@@ -213,10 +213,10 @@ describe("useSubtaskPromptZone", () => {
+     const { result } = renderHook(() => useSubtaskPromptHarness());
+ 
+     act(() => {
+-      result.current.setPromptValue("next prompt");
++      result.current.setPromptValue("  next prompt  ");
+     });
+ 
+-    expect(result.current.resolvePrompt()).toBe("next prompt");
++    expect(result.current.resolvePrompt()).toBe("  next prompt  ");
+   });
+ });
+ 
+@@ -253,22 +253,23 @@ describe("useSubtaskSubmit", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     mockHasPendingAttachmentUploads.mockReturnValue(false);
+-    mockCreateTask.mockResolvedValue({ id: CREATED_TASK_ID, session_id: CREATED_SESSION_ID });
++    mockSubmitTask.mockResolvedValue({ id: CREATED_TASK_ID, session_id: CREATED_SESSION_ID });
+   });
+ 
+   it("sends the auto-title contract without a title", async () => {
+     const onClose = vi.fn();
+-    const opts = makeSubmitOptions({ autoTitle: true, onClose });
++    const opts = makeSubmitOptions({ autoTitle: true, onClose, resolvePrompt: () => "  do the work  " });
+     const { result } = renderHook(() => useSubtaskSubmit(opts));
+ 
+     await act(async () => {
+       await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+     });
+ 
+-    expect(mockCreateTask).toHaveBeenCalledWith(
++    expect(mockSubmitTask).toHaveBeenCalledWith(
+       expect.objectContaining({ auto_title: true, description: "do the work" }),
++      "  do the work  ",
+     );
+-    expect(mockCreateTask.mock.calls[0][0]).not.toHaveProperty("title");
++    expect(mockSubmitTask.mock.calls[0][0]).not.toHaveProperty("title");
+     expect(opts.onClose).toHaveBeenCalledOnce();
+     expect(mockSetActiveTask).toHaveBeenCalledWith(CREATED_TASK_ID);
+     expect(mockSetActiveSession).toHaveBeenCalledWith(CREATED_TASK_ID, CREATED_SESSION_ID);
+@@ -286,7 +287,7 @@ describe("useSubtaskSubmit", () => {
+       await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+     });
+ 
+-    expect(mockCreateTask).toHaveBeenCalledWith(expect.objectContaining({ autopilot: true }));
++    expect(mockSubmitTask).toHaveBeenCalledWith(expect.objectContaining({ autopilot: true }), "do the work");
+   });
+ 
+   it("passes fresh-branch metadata when a local executor uses a policy row", async () => {
+@@ -333,7 +334,7 @@ describe("useSubtaskSubmit", () => {
+       await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+     });
+ 
+-    expect(mockCreateTask).not.toHaveBeenCalled();
++    expect(mockSubmitTask).not.toHaveBeenCalled();
+   });
+ 
+   it("preserves the legacy title payload", async () => {
+@@ -344,10 +345,11 @@ describe("useSubtaskSubmit", () => {
+       await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+     });
+ 
+-    expect(mockCreateTask).toHaveBeenCalledWith(
++    expect(mockSubmitTask).toHaveBeenCalledWith(
+       expect.objectContaining({ title: "Manual title", description: "do the work" }),
++      "do the work",
+     );
+-    expect(mockCreateTask.mock.calls[0][0]).not.toHaveProperty("auto_title");
++    expect(mockSubmitTask.mock.calls[0][0]).not.toHaveProperty("auto_title");
+   });
+ 
+   it("rejects an empty prompt before creating", async () => {
+@@ -358,7 +360,7 @@ describe("useSubtaskSubmit", () => {
+       await result.current.handleSubmit({ preventDefault: vi.fn() } as never);
+     });
+ 
+-    expect(mockCreateTask).not.toHaveBeenCalled();
++    expect(mockSubmitTask).not.toHaveBeenCalled();
+   });
+ 
+   it("does not create while an attachment upload is pending", async () => {
+@@ -381,14 +383,14 @@ describe("useSubtaskSubmit", () => {
+     });
+ 
+     expect(mockHasPendingAttachmentUploads).toHaveBeenCalledWith([pendingAttachment]);
+-    expect(mockCreateTask).not.toHaveBeenCalled();
++    expect(mockSubmitTask).not.toHaveBeenCalled();
+     expect(opts.setIsCreating).not.toHaveBeenCalled();
+   });
+ 
+   it("cleans up the creating state after a request failure", async () => {
+     const opts = makeSubmitOptions();
+     const error = new Error("request failed");
+-    mockCreateTask.mockRejectedValueOnce(error);
++    mockSubmitTask.mockRejectedValueOnce(error);
+     const { result } = renderHook(() => useSubtaskSubmit(opts));
+ 
+     await act(async () => {
+diff --git a/web/components/task/use-subtask-submit.ts b/web/components/task/use-subtask-submit.ts
+index 4dcaec0..e97114d 100644
+--- a/web/components/task/use-subtask-submit.ts
++++ b/web/components/task/use-subtask-submit.ts
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useMemo, useRef } from "react";
+-import { createTask } from "@/lib/api/domains/kanban-api";
++import { submitTask } from "@/lib/api/domains/kanban-api";
+ import { replaceTaskUrl } from "@/lib/links";
+ import { useAppStore } from "@/components/state-provider";
+ import {
+@@ -48,6 +48,7 @@ type CreateSubtaskArgs = {
+   trimmedTitle: string;
+   prompt: string;
+   autoTitle: boolean;
++  humanPrompt: string;
+   autopilot: boolean;
+   workspaceMode: SubtaskWorkspaceMode;
+   isLocalExecutor: boolean;
+@@ -67,6 +68,7 @@ async function createSubtask({
+   attachments,
+   trimmedTitle,
+   prompt,
++  humanPrompt,
+   autoTitle,
+   autopilot,
+   workspaceMode,
+@@ -91,7 +93,7 @@ async function createSubtask({
+             ? { confirmDiscard: false, consentedDirtyFiles: [] }
+             : undefined,
+         });
+-  const response = await createTask({
++  const response = await submitTask({
+     workspace_id: workspaceId,
+     workflow_id: workflowId,
+     ...(autoTitle ? { auto_title: true } : { title: trimmedTitle }),
+@@ -105,7 +107,7 @@ async function createSubtask({
+     attachments: toMessageAttachments(attachments),
+     workspace_mode: workspaceMode,
+     autopilot: autopilot || undefined,
+-  });
++  }, humanPrompt);
+   const newSessionId = response.session_id ?? response.primary_session_id ?? null;
+   // Close the dialog before navigation. Navigation can remount the sidebar
+   // that owns the dialog state, which makes a later close update a stale owner.
+@@ -154,7 +156,8 @@ export function useSubtaskSubmit(opts: UseSubtaskSubmitOpts) {
+       e.preventDefault();
+       if (isSubmittingRef.current) return;
+       const trimmedTitle = title.trim();
+-      const prompt = resolvePrompt().trim();
++      const humanPrompt = resolvePrompt();
++      const prompt = humanPrompt.trim();
+       if ((!autoTitle && !trimmedTitle) || !prompt || !workspaceId || !workflowId) return;
+       if (hasPendingAttachmentUploads(attachments)) return;
+ 
+@@ -171,6 +174,7 @@ export function useSubtaskSubmit(opts: UseSubtaskSubmitOpts) {
+           attachments,
+           trimmedTitle,
+           prompt,
++          humanPrompt,
+           autoTitle,
+           autopilot,
+           workspaceMode,
+@@ -294,9 +298,8 @@ export function useSubtaskPromptZone(opts: {
+     ],
+   );
+   const resolvePrompt = useCallback(() => {
+-    const typed = promptValue.trim();
+-    if (contextValue === "copy_prompt" && !typed && initialPrompt) return initialPrompt;
+-    return typed;
++    if (contextValue === "copy_prompt" && !promptValue.trim() && initialPrompt) return initialPrompt;
++    return promptValue;
+   }, [contextValue, initialPrompt, promptValue]);
+   return {
+     promptRef,
+diff --git a/web/hooks/domains/session/use-queue-provenance.test.tsx b/web/hooks/domains/session/use-queue-provenance.test.tsx
+new file mode 100644
+index 0000000..60142fb
+--- /dev/null
++++ b/web/hooks/domains/session/use-queue-provenance.test.tsx
+@@ -0,0 +1,55 @@
++import { act, renderHook } from "@testing-library/react";
++import { beforeEach, expect, it, vi } from "vitest";
++
++const request = vi.hoisted(() => vi.fn());
++const store = vi.hoisted(() => ({
++  queue: { bySessionId: {}, metaBySessionId: {}, isLoading: {} },
++  taskSessions: { items: {} },
++  connection: { status: "disconnected" },
++  setQueueEntries: vi.fn(),
++  removeQueueEntry: vi.fn(),
++  setQueueLoading: vi.fn(),
++}));
++
++vi.mock("@/components/state-provider", () => ({
++  useAppStore: (selector: (state: typeof store) => unknown) => selector(store),
++}));
++vi.mock("@/hooks/use-foreground-refresh", () => ({ useForegroundRefresh: vi.fn() }));
++vi.mock("@/lib/ws/connection", () => ({
++  getWebSocketClient: () => ({ request }),
++}));
++
++import { useQueue } from "./use-queue";
++
++beforeEach(() => {
++  request.mockReset();
++  request.mockImplementation(async (action: string) =>
++    action === "message.queue.get" ? { entries: [], count: 0, max: 10 } : {},
++  );
++});
++
++it("submits browser queue text and full edits through trusted actions", async () => {
++  const { result } = renderHook(() => useQueue("session"));
++
++  await act(async () => {
++    await result.current.queue({ taskId: "task", content: "  original text  " });
++    await result.current.editEntry("entry", "new text");
++  });
++
++  expect(request).toHaveBeenCalledWith("message.queue.submit", {
++    session_id: "session",
++    task_id: "task",
++    content: "  original text  ",
++    model: undefined,
++    plan_mode: undefined,
++    attachments: undefined,
++    entity_references: undefined,
++  });
++  expect(request).toHaveBeenCalledWith("message.queue.submit_update", {
++    session_id: "session",
++    entry_id: "entry",
++    content: "new text",
++    attachments: undefined,
++    entity_references: [],
++  });
++});
+diff --git a/web/hooks/domains/session/use-queue.ts b/web/hooks/domains/session/use-queue.ts
+index 7f3619c..3d0e691 100644
+--- a/web/hooks/domains/session/use-queue.ts
++++ b/web/hooks/domains/session/use-queue.ts
+@@ -2,10 +2,10 @@ import { useEffect, useCallback, useRef } from "react";
+ import { useAppStore } from "@/components/state-provider";
+ import { useForegroundRefresh } from "@/hooks/use-foreground-refresh";
+ import {
+-  queueMessage,
++  submitQueuedMessage,
+   clearQueue,
+   getQueueStatus,
+-  updateQueuedMessage,
++  submitQueuedUpdate,
+   removeQueuedEntry,
+   mergeQueuedEntry,
+   reorderQueuedEntries,
+@@ -175,6 +175,7 @@ function useQueueRefetch(
+           max: status.max,
+           mergeEnabled: status.merge_enabled ?? true,
+           autoRun: status.auto_run ?? true,
++          blockedReason: status.blocked_reason,
+         });
+       } finally {
+         if (refetchVersion.current[sid] === version) setQueueLoading(sid, false);
+@@ -214,7 +215,7 @@ function useQueueActions({
+       if (!sessionId) return;
+       setQueueLoading(sessionId, true);
+       try {
+-        await queueMessage({
++        await submitQueuedMessage({
+           session_id: sessionId,
+           task_id: taskId,
+           content,
+@@ -443,7 +444,7 @@ function useEntryMutations({ sessionId, removeQueueEntry, refetch }: EntryMutati
+     ) => {
+       if (!sessionId) return;
+       try {
+-        await updateQueuedMessage({
++        await submitQueuedUpdate({
+           session_id: sessionId,
+           entry_id: entryId,
+           content,
+@@ -577,6 +578,7 @@ export function useQueue(sessionId: string | null) {
+     isFull: meta ? meta.count >= meta.max && meta.max > 0 : false,
+     mergeEnabled: meta?.mergeEnabled ?? true,
+     autoRun: meta?.autoRun ?? true,
++    blockedReason: meta?.blockedReason,
+     isLoading,
+     cancellationPending,
+     queue,
+diff --git a/web/hooks/use-message-handler.test.ts b/web/hooks/use-message-handler.test.ts
+index b3c2490..80e4449 100644
+--- a/web/hooks/use-message-handler.test.ts
++++ b/web/hooks/use-message-handler.test.ts
+@@ -17,7 +17,7 @@ const TASK_ID = "task-1";
+ const SESSION_ID = "session-1";
+ const RETRY_ID_ONE = "client-message-1";
+ const RETRY_ID_TWO = "client-message-2";
+-const MESSAGE_ADD_ACTION = "message.add";
++const MESSAGE_ADD_ACTION = "message.submit";
+ const CONTEXT_DIRECTORY_PATH = "src/components";
+ const storeState = vi.hoisted(() => ({
+   current: {
+diff --git a/web/hooks/use-message-handler.ts b/web/hooks/use-message-handler.ts
+index b3ce875..ff8e7c2 100644
+--- a/web/hooks/use-message-handler.ts
++++ b/web/hooks/use-message-handler.ts
+@@ -270,7 +270,7 @@ export async function sendMessageRequest(
+ 
+   const request = () =>
+     client.request<Message | undefined>(
+-      "message.add",
++      "message.submit",
+       requestPayload,
+       hasAttachments ? 30000 : 10000,
+     );
+diff --git a/web/lib/api/domains/kanban-api.ts b/web/lib/api/domains/kanban-api.ts
+index 52d4de2..5e1d81f 100644
+--- a/web/lib/api/domains/kanban-api.ts
++++ b/web/lib/api/domains/kanban-api.ts
+@@ -132,6 +132,21 @@ export async function createTask(
+   });
+ }
+ 
++export async function submitTask(
++  payload: Parameters<typeof createTask>[0],
++  humanPrompt: string,
++  options?: ApiRequestOptions,
++) {
++  return fetchJson<CreateTaskResponse>("/api/v1/tasks/submit", {
++    ...options,
++    init: {
++      method: "POST",
++      body: JSON.stringify({ ...payload, human_prompt: humanPrompt }),
++      ...(options?.init ?? {}),
++    },
++  });
++}
++
+ export async function updateTask(
+   taskId: string,
+   payload: {
+diff --git a/web/lib/api/domains/queue-api.ts b/web/lib/api/domains/queue-api.ts
+index 48547e7..e8aac88 100644
+--- a/web/lib/api/domains/queue-api.ts
++++ b/web/lib/api/domains/queue-api.ts
+@@ -158,12 +158,20 @@ export type QueueMessageParams = {
+ 
+ /** Append a new entry to the session's FIFO queue. Throws QueueFullError on overflow. */
+ export async function queueMessage(params: QueueMessageParams): Promise<QueuedMessage> {
++  return requestQueuedMessage("message.queue.add", params);
++}
++
++export async function submitQueuedMessage(params: QueueMessageParams): Promise<QueuedMessage> {
++  return requestQueuedMessage("message.queue.submit", params);
++}
++
++async function requestQueuedMessage(action: string, params: QueueMessageParams): Promise<QueuedMessage> {
+   const client = getWebSocketClient();
+   if (!client) {
+     throw new Error(WS_CLIENT_UNAVAILABLE);
+   }
+   try {
+-    return await client.request<QueuedMessage>("message.queue.add", params);
++    return await client.request<QueuedMessage>(action, params);
+   } catch (err) {
+     rethrowQueueError(err);
+   }
+@@ -276,12 +284,20 @@ export async function updateQueuedMessage(params: {
+   entity_references: EntityReference[];
+   user_id?: string;
+ }): Promise<{ entry_id: string }> {
++  return requestQueuedUpdate("message.queue.update", params);
++}
++
++export async function submitQueuedUpdate(params: Parameters<typeof updateQueuedMessage>[0]): Promise<{ entry_id: string }> {
++  return requestQueuedUpdate("message.queue.submit_update", params);
++}
++
++async function requestQueuedUpdate(action: string, params: Parameters<typeof updateQueuedMessage>[0]): Promise<{ entry_id: string }> {
+   const client = getWebSocketClient();
+   if (!client) {
+     throw new Error(WS_CLIENT_UNAVAILABLE);
+   }
+   try {
+-    return await client.request<{ entry_id: string }>("message.queue.update", {
++    return await client.request<{ entry_id: string }>(action, {
+       ...params,
+       entity_references: params.entity_references ?? [],
+     });
+diff --git a/web/lib/state/slices/session/types.ts b/web/lib/state/slices/session/types.ts
+index d0d6577..eb85981 100644
+--- a/web/lib/state/slices/session/types.ts
++++ b/web/lib/state/slices/session/types.ts
+@@ -173,6 +173,7 @@ export type QueueMeta = {
+   /** Mirrors the server's message queue merge_enabled setting; hides the
+    * "Merge with above" affordance without a separate settings fetch. */
+   mergeEnabled: boolean;
++  blockedReason?: string;
+ };
+ 
+ export type QueueStatus = {
+@@ -181,6 +182,7 @@ export type QueueStatus = {
+   max: number;
+   merge_enabled: boolean;
+   auto_run?: boolean;
++  blocked_reason?: string;
+ };
+ 
+ export type QueueState = {
+diff --git a/web/lib/types/session-events.ts b/web/lib/types/session-events.ts
+index 026175c..73657f9 100644
+--- a/web/lib/types/session-events.ts
++++ b/web/lib/types/session-events.ts
+@@ -197,6 +197,7 @@ export type QueueStatusChangedPayload = {
+   max?: number;
+   merge_enabled?: boolean;
+   auto_run?: boolean;
++  blocked_reason?: string;
+ };
+ 
+ export type AvailableCommandPayload = {
+diff --git a/web/lib/ws/handlers/agent-session.ts b/web/lib/ws/handlers/agent-session.ts
+index f49a8d8..8bbc4bd 100644
+--- a/web/lib/ws/handlers/agent-session.ts
++++ b/web/lib/ws/handlers/agent-session.ts
+@@ -727,9 +727,10 @@ function handleQueueStatusChangedMessage(
+       : (previousMeta?.mergeEnabled ?? true);
+   const autoRun =
+     typeof payload.auto_run === "boolean" ? payload.auto_run : (previousMeta?.autoRun ?? true);
++  const blockedReason = payload.blocked_reason ?? previousMeta?.blockedReason;
+   store
+     .getState()
+-    .setQueueEntries(payload.session_id, entries, { count, max, mergeEnabled, autoRun });
++    .setQueueEntries(payload.session_id, entries, { count, max, mergeEnabled, autoRun, blockedReason });
+ }
+ 
+ /** Registers the task-session WebSocket handlers (state, messages, workspace sources, queue). */
+diff --git a/web/src/locales/en/chat.json b/web/src/locales/en/chat.json
+index 7e9b92c..d13cf31 100644
+--- a/web/src/locales/en/chat.json
++++ b/web/src/locales/en/chat.json
+@@ -91,6 +91,7 @@
+   "queueAutoRun": "Auto-run",
+   "queueAutoRunOffHelp": "Finishes the current response, then queued messages wait.",
+   "queueAutoRunOnHelp": "Runs queued messages one at a time.",
++  "queueNativeBatchUnsupported": "This session cannot deliver a combined queued message.",
+   "queueChipExpand_one": "{{count}} queued message, click to expand",
+   "queueChipExpand_other": "{{count}} queued messages, click to expand",
+   "queueCount_one": "{{count}}",
+diff --git a/web/src/locales/pseudo/chat.json b/web/src/locales/pseudo/chat.json
+index 21ec2d4..12fa0cc 100644
+--- a/web/src/locales/pseudo/chat.json
++++ b/web/src/locales/pseudo/chat.json
+@@ -91,6 +91,7 @@
+   "queueAutoRun": "Àũţō-ŕũń",
+   "queueAutoRunOffHelp": "Ƒĩńĩśĥēś ţĥē ćũŕŕēńţ ŕēśƥōńśē, ţĥēń qũēũēď ḿēśśàĝēś ŵàĩţ.",
+   "queueAutoRunOnHelp": "Ŕũńś qũēũēď ḿēśśàĝēś ōńē àţ à ţĩḿē.",
++  "queueNativeBatchUnsupported": "Ţĥĩś śēśśĩōń ćàńńōţ ďēĺĩvēŕ à ćōḿƀĩńēď qũēũēď ḿēśśàĝē.",
+   "queueChipExpand_one": "{{count}} qũēũēď ḿēśśàĝē, ćĺĩćķ ţō ēxƥàńď",
+   "queueChipExpand_other": "{{count}} qũēũēď ḿēśśàĝēś, ćĺĩćķ ţō ēxƥàńď",
+   "queueCount_one": "{{count}}",
+diff --git a/web/src/locales/pt-pt/chat.json b/web/src/locales/pt-pt/chat.json
+index 1a80135..6a0d037 100644
+--- a/web/src/locales/pt-pt/chat.json
++++ b/web/src/locales/pt-pt/chat.json
+@@ -75,6 +75,7 @@
+   "queueAutoRun": "Execução automática",
+   "queueAutoRunOffHelp": "Termina a resposta atual e depois as mensagens em fila aguardam.",
+   "queueAutoRunOnHelp": "Executa as mensagens em fila, uma de cada vez.",
++  "queueNativeBatchUnsupported": "Esta sessão não consegue entregar uma mensagem combinada em fila.",
+   "queueChipExpand_one": "{{count}} mensagem em fila, clique para expandir",
+   "queueChipExpand_other": "{{count}} mensagens em fila, clique para expandir",
+   "queueCount_one": "{{count}}",
+diff --git a/web/src/locales/zh-cn/chat.json b/web/src/locales/zh-cn/chat.json
+index 8a8097f..bf8773e 100644
+--- a/web/src/locales/zh-cn/chat.json
++++ b/web/src/locales/zh-cn/chat.json
+@@ -82,6 +82,7 @@
+   "queueAutoRun": "自动运行",
+   "queueAutoRunOffHelp": "完成当前回复后，排队中的消息将等待。",
+   "queueAutoRunOnHelp": "逐条运行排队中的消息。",
++  "queueNativeBatchUnsupported": "此会话无法发送合并的排队消息。",
+   "queueChipExpand_one": "{{count}} 条排队消息，点击展开",
+   "queueChipExpand_other": "{{count}} 条排队消息，点击展开",
+   "queueCount_one": "{{count}}",
+diff --git a/web/src/locales/zh-hk/chat.json b/web/src/locales/zh-hk/chat.json
+index 05edd77..6332c06 100644
+--- a/web/src/locales/zh-hk/chat.json
++++ b/web/src/locales/zh-hk/chat.json
+@@ -82,6 +82,7 @@
+   "queueAutoRun": "自動執行",
+   "queueAutoRunOffHelp": "完成目前回覆後，排隊中的訊息將等待。",
+   "queueAutoRunOnHelp": "逐條執行排隊中的訊息。",
++  "queueNativeBatchUnsupported": "此工作階段無法傳送合併的佇列訊息。",
+   "queueChipExpand_one": "{{count}} 條排隊訊息，點擊展開",
+   "queueChipExpand_other": "{{count}} 條排隊訊息，點擊展開",
+   "queueCount_one": "{{count}}",
+diff --git a/web/src/locales/zh-tw/chat.json b/web/src/locales/zh-tw/chat.json
+index fb51afc..473454e 100644
+--- a/web/src/locales/zh-tw/chat.json
++++ b/web/src/locales/zh-tw/chat.json
+@@ -82,6 +82,7 @@
+   "queueAutoRun": "自動執行",
+   "queueAutoRunOffHelp": "完成目前回覆後，排隊中的訊息將等待。",
+   "queueAutoRunOnHelp": "逐條執行排隊中的訊息。",
++  "queueNativeBatchUnsupported": "此工作階段無法傳送合併的佇列訊息。",
+   "queueChipExpand_one": "{{count}} 條排隊訊息，點選展開",
+   "queueChipExpand_other": "{{count}} 條排隊訊息，點選展開",
+   "queueCount_one": "{{count}}",

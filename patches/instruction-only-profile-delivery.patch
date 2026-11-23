@@ -1,0 +1,305 @@
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
+index b89a51f..70eb24c 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer.go
+@@ -97,6 +97,9 @@ func (d *Deployer) Deploy(ctx context.Context, req Request) (DeployResult, error
+ 		return DeployResult{}, errors.New("skill deploy: profile is required")
+ 	}
+ 	manifest := d.buildManifest(ctx, req.Profile, d.workspaceSlugFn(req.WorkspaceID))
++	if len(manifest.Skills) == 0 && len(manifest.Instructions) == 0 {
++		return DeployResult{}, nil
++	}
+ 	result := d.deliver(ctx, manifest, req.ExecutorType, req.WorkspacePath)
+ 	return result, nil
+ }
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+index 3b2c0fd..d4ad184 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill/deployer_test.go
+@@ -333,14 +333,11 @@ func TestDeploy_KanbanProfile_NoSkillsNoOp(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("Deploy: %v", err)
+ 	}
+-	// instructionsDir is still computed (deterministic path); the
+-	// runtime caller decides whether to use it. The on-host tree must
+-	// not contain any files because the manifest is empty.
+ 	if entries, err := os.ReadDir(filepath.Join(base, "runtime")); err == nil && len(entries) > 0 {
+ 		t.Errorf("host runtime tree should be untouched, got %v", entries)
+ 	}
+-	if res.InstructionsDir == "" {
+-		t.Errorf("instructionsDir should be deterministic even for empty manifest")
++	if len(res.Metadata) != 0 || res.InstructionsDir != "" {
++		t.Errorf("empty manifest result = %+v", res)
+ 	}
+ }
+ 
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
+index cab5502..1622265 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy.go
+@@ -33,11 +33,6 @@ func (m *Manager) runSkillDeploy(ctx context.Context, original, prepared *Launch
+ 			zap.Error(err))
+ 		return
+ 	}
+-	if len(profile.SkillIDs) == 0 && len(profile.DesiredSkills) == 0 {
+-		// Fast path: shallow / kanban-flavour profiles with no enrichment to
+-		// deploy. Most launches today land here.
+-		return
+-	}
+ 	req := SkillDeployRequest{
+ 		Profile:       profile,
+ 		WorkspacePath: prepared.WorkspacePath,
+diff --git a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
+index 1d63e6b..a3c0c78 100644
+--- a/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
++++ b/apps/backend/internal/agent/runtime/lifecycle/skill_deploy_test.go
+@@ -62,10 +62,8 @@ func TestRunSkillDeploy_NoOpWithoutReader(t *testing.T) {
+ 	}
+ }
+ 
+-// TestRunSkillDeploy_FastPathEmptyProfile verifies that a shallow / kanban
+-// profile (empty skill_ids, empty desired_skills) short-circuits before
+-// invoking the deployer.
+-func TestRunSkillDeploy_FastPathEmptyProfile(t *testing.T) {
++// TestRunSkillDeploy_EmptySkillsInvokesDeployer verifies that instruction-only profiles still reach the deployer.
++func TestRunSkillDeploy_EmptySkillsInvokesDeployer(t *testing.T) {
+ 	mgr := newSkillDeployTestManager(t)
+ 	rec := &recordingDeployer{}
+ 	mgr.skillDeployer = rec
+@@ -77,8 +75,8 @@ func TestRunSkillDeploy_FastPathEmptyProfile(t *testing.T) {
+ 		&LaunchRequest{AgentProfileID: "p1"},
+ 		&LaunchRequest{WorkspacePath: "/tmp/ws", ExecutorType: "local_pc"})
+ 
+-	if rec.called.Load() != 0 {
+-		t.Errorf("shallow profile should fast-path, deployer was called %d times", rec.called.Load())
++	if rec.called.Load() != 1 {
++		t.Errorf("instruction-only profile should reach deployer, got %d calls", rec.called.Load())
+ 	}
+ }
+ 
+diff --git a/apps/backend/internal/office/service/instructions_test.go b/apps/backend/internal/office/service/instructions_test.go
+index a61169d..0f5bb4f 100644
+--- a/apps/backend/internal/office/service/instructions_test.go
++++ b/apps/backend/internal/office/service/instructions_test.go
+@@ -5,8 +5,32 @@ import (
+ 	"testing"
+ 
+ 	"github.com/kandev/kandev/internal/office/models"
++	"github.com/kandev/kandev/internal/office/service"
+ )
+ 
++func TestSkillManifestUsesEffectiveInstructions(t *testing.T) {
++	svc := newTestService(t, service.ServiceOptions{AgentTypeResolver: func(string) string { return "codex-acp" }})
++	ctx := context.Background()
++	if err := svc.UpsertInstruction(ctx, "codex-acp", "AGENTS.md", "family", true); err != nil {
++		t.Fatal(err)
++	}
++	agent := &models.AgentInstance{ID: "profile-1", AgentID: "codex-acp", WorkspaceID: "default", Name: "Agent", Role: models.AgentRoleSpecialist}
++	if err := svc.CreateAgentInstance(ctx, agent); err != nil {
++		t.Fatal(err)
++	}
++	manifest := service.BuildSkillManifestForTest(service.NewSchedulerIntegration(svc, 0), ctx, agent, "default")
++	if len(manifest.Instructions) != 1 || manifest.Instructions[0].Content != "family" {
++		t.Fatalf("family instructions = %+v", manifest.Instructions)
++	}
++	if err := svc.UpsertInstruction(ctx, agent.ID, "AGENTS.md", "", true); err != nil {
++		t.Fatal(err)
++	}
++	manifest = service.BuildSkillManifestForTest(service.NewSchedulerIntegration(svc, 0), ctx, agent, "default")
++	if len(manifest.Instructions) != 1 || manifest.Instructions[0].Content != "" {
++		t.Fatalf("empty profile override = %+v", manifest.Instructions)
++	}
++}
++
+ func TestCreateDefaultInstructions_CEO(t *testing.T) {
+ 	svc := newTestService(t)
+ 	ctx := context.Background()
+diff --git a/apps/backend/internal/office/service/skill_manifest.go b/apps/backend/internal/office/service/skill_manifest.go
+index 70832da..8bd1fdb 100644
+--- a/apps/backend/internal/office/service/skill_manifest.go
++++ b/apps/backend/internal/office/service/skill_manifest.go
+@@ -6,6 +6,7 @@ import (
+ 	"go.uber.org/zap"
+ 
+ 	"github.com/kandev/kandev/internal/office/models"
++	officeskills "github.com/kandev/kandev/internal/office/skills"
+ )
+ 
+ // SkillManifest holds the resolved skills and instructions for an agent session.
+@@ -69,7 +70,7 @@ func (si *SchedulerIntegration) buildSkillManifest(
+ 	}
+ 
+ 	// Load instruction files from DB.
+-	files, err := si.svc.repo.ListInstructions(ctx, agent.ID)
++	files, err := officeskills.ListEffectiveInstructions(ctx, si.svc.repo, agentTypeID, agent.ID)
+ 	if err != nil {
+ 		si.logger.Warn("failed to load instructions for manifest",
+ 			zap.String("agent_id", agent.ID), zap.Error(err))
+diff --git a/apps/backend/internal/office/skills/runtime_adapter.go b/apps/backend/internal/office/skills/runtime_adapter.go
+index 39a77fb..9e60b19 100644
+--- a/apps/backend/internal/office/skills/runtime_adapter.go
++++ b/apps/backend/internal/office/skills/runtime_adapter.go
+@@ -20,9 +20,8 @@ type officeSkillReader interface {
+ 	GetSkillFromConfig(ctx context.Context, idOrSlug string) (*models.Skill, error)
+ }
+ 
+-// officeInstructionLister wraps anything that lists instruction files
+-// for an agent_profile_id.
+-type officeInstructionLister interface {
++// InstructionFileLister reads instruction files owned by an agent family or profile.
++type InstructionFileLister interface {
+ 	ListInstructions(ctx context.Context, agentProfileID string) ([]*models.InstructionFile, error)
+ }
+ 
+@@ -85,24 +84,23 @@ func runtimeSkillFiles(raw string) []runtimeskill.SkillFile {
+ // InstructionListerAdapter bridges an office repo to the runtime-tier
+ // InstructionLister interface used by skill.Deployer.
+ type InstructionListerAdapter struct {
+-	inner officeInstructionLister
++	inner InstructionFileLister
+ }
+ 
+ // NewInstructionListerAdapter wraps an office instruction lister for
+ // the runtime.
+-func NewInstructionListerAdapter(inner officeInstructionLister) *InstructionListerAdapter {
++func NewInstructionListerAdapter(inner InstructionFileLister) *InstructionListerAdapter {
+ 	return &InstructionListerAdapter{inner: inner}
+ }
+ 
+-// ListInstructions satisfies runtimeskill.InstructionLister. Returns
+-// nil when the office lister is unset.
+-func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentTypeID, agentProfileID string) ([]*runtimeskill.InstructionFile, error) {
+-	if a == nil || a.inner == nil {
++// ListEffectiveInstructions merges family defaults with profile overrides by filename.
++func ListEffectiveInstructions(ctx context.Context, inner InstructionFileLister, agentTypeID, agentProfileID string) ([]*models.InstructionFile, error) {
++	if inner == nil {
+ 		return nil, nil
+ 	}
+ 	var familyFiles []*models.InstructionFile
+ 	if agentTypeID != "" {
+-		files, err := a.inner.ListInstructions(ctx, agentTypeID)
++		files, err := inner.ListInstructions(ctx, agentTypeID)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -110,28 +108,21 @@ func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentTy
+ 	}
+ 	var profileFiles []*models.InstructionFile
+ 	if agentProfileID != "" && agentProfileID != agentTypeID {
+-		files, err := a.inner.ListInstructions(ctx, agentProfileID)
++		files, err := inner.ListInstructions(ctx, agentProfileID)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		profileFiles = files
+ 	}
+-	merged := make(map[string]*runtimeskill.InstructionFile, len(familyFiles)+len(profileFiles))
+-	merge := func(files []*models.InstructionFile) {
+-		for _, f := range files {
+-			if f == nil {
+-				continue
+-			}
+-			merged[f.Filename] = &runtimeskill.InstructionFile{
+-				Filename: f.Filename,
+-				Content:  f.Content,
+-				IsEntry:  f.IsEntry,
++	merged := make(map[string]*models.InstructionFile, len(familyFiles)+len(profileFiles))
++	for _, files := range [][]*models.InstructionFile{familyFiles, profileFiles} {
++		for _, file := range files {
++			if file != nil {
++				merged[file.Filename] = file
+ 			}
+ 		}
+ 	}
+-	merge(familyFiles)
+-	merge(profileFiles)
+-	out := make([]*runtimeskill.InstructionFile, 0, len(merged))
++	out := make([]*models.InstructionFile, 0, len(merged))
+ 	for _, file := range merged {
+ 		out = append(out, file)
+ 	}
+@@ -143,3 +134,20 @@ func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentTy
+ 	})
+ 	return out, nil
+ }
++
++// ListInstructions satisfies runtimeskill.InstructionLister. Returns
++// nil when the office lister is unset.
++func (a *InstructionListerAdapter) ListInstructions(ctx context.Context, agentTypeID, agentProfileID string) ([]*runtimeskill.InstructionFile, error) {
++	if a == nil || a.inner == nil {
++		return nil, nil
++	}
++	files, err := ListEffectiveInstructions(ctx, a.inner, agentTypeID, agentProfileID)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]*runtimeskill.InstructionFile, 0, len(files))
++	for _, file := range files {
++		out = append(out, &runtimeskill.InstructionFile{Filename: file.Filename, Content: file.Content, IsEntry: file.IsEntry})
++	}
++	return out, nil
++}
+diff --git a/apps/backend/internal/office/skills/runtime_adapter_test.go b/apps/backend/internal/office/skills/runtime_adapter_test.go
+index d206167..d04d69e 100644
+--- a/apps/backend/internal/office/skills/runtime_adapter_test.go
++++ b/apps/backend/internal/office/skills/runtime_adapter_test.go
+@@ -46,32 +46,34 @@ func TestSkillReaderAdapterMapsInventoryFiles(t *testing.T) {
+ }
+ 
+ func TestInstructionListerAdapterMergesFamilyDefaultsWithProfileOverrides(t *testing.T) {
+-	adapter := NewInstructionListerAdapter(stubOfficeInstructionLister{files: map[string][]*models.InstructionFile{
+-		"codex-acp": {
+-			{Filename: "AGENTS.md", Content: "family", IsEntry: true},
+-			{Filename: "FAMILY.md", Content: "shared"},
+-		},
+-		"profile-1": {
+-			{Filename: "AGENTS.md", Content: "profile", IsEntry: true},
+-			{Filename: "PROFILE.md", Content: "specific"},
+-		},
+-	}})
++	for _, override := range []string{"profile", ""} {
++		adapter := NewInstructionListerAdapter(stubOfficeInstructionLister{files: map[string][]*models.InstructionFile{
++			"codex-acp": {
++				{Filename: "AGENTS.md", Content: "family", IsEntry: true},
++				{Filename: "FAMILY.md", Content: "shared"},
++			},
++			"profile-1": {
++				{Filename: "AGENTS.md", Content: override, IsEntry: true},
++				{Filename: "PROFILE.md", Content: "specific"},
++			},
++		}})
+ 
+-	got, err := adapter.ListInstructions(context.Background(), "codex-acp", "profile-1")
+-	if err != nil {
+-		t.Fatalf("ListInstructions: %v", err)
+-	}
+-	if len(got) != 3 {
+-		t.Fatalf("instructions = %+v, want three files", got)
+-	}
+-	if got[0].Filename != "AGENTS.md" || got[0].Content != "profile" || !got[0].IsEntry {
+-		t.Fatalf("entry instruction = %+v", got[0])
+-	}
+-	if got[1].Filename != "FAMILY.md" || got[1].Content != "shared" {
+-		t.Fatalf("family instruction = %+v", got[1])
+-	}
+-	if got[2].Filename != "PROFILE.md" || got[2].Content != "specific" {
+-		t.Fatalf("profile instruction = %+v", got[2])
++		got, err := adapter.ListInstructions(context.Background(), "codex-acp", "profile-1")
++		if err != nil {
++			t.Fatalf("ListInstructions: %v", err)
++		}
++		if len(got) != 3 {
++			t.Fatalf("instructions = %+v, want three files", got)
++		}
++		if got[0].Filename != "AGENTS.md" || got[0].Content != override || !got[0].IsEntry {
++			t.Fatalf("entry instruction = %+v", got[0])
++		}
++		if got[1].Filename != "FAMILY.md" || got[1].Content != "shared" {
++			t.Fatalf("family instruction = %+v", got[1])
++		}
++		if got[2].Filename != "PROFILE.md" || got[2].Content != "specific" {
++			t.Fatalf("profile instruction = %+v", got[2])
++		}
+ 	}
+ }
+ 
